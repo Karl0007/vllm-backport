@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import errno
+import fcntl
 import mmap
 import os
+import platform
 import time
 from collections.abc import Callable
 
@@ -19,6 +21,157 @@ logger = init_logger(__name__)
 
 # MADV_POPULATE_WRITE was added in Linux 5.14 (value 23).
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
+
+
+def _reclaim_stale_regions(exclude_path: str) -> int:
+    """Delete offload region files whose owning engine is gone.
+
+    Every process holds a shared flock on its region file for the file's
+    whole lifetime (taken right after open, fd kept open until cleanup),
+    and the kernel drops flocks automatically on process death --
+    including SIGKILL. A region file we can lock exclusively therefore
+    has no live owner. Without this reaper, every fail-fast boot crash
+    leaks its region into /dev/shm (engine ids are fresh per boot) until
+    the free-space precheck refuses to boot at all, turning a transient
+    crash into a permanent crash loop that restart policies cannot heal.
+
+    Files younger than 60s are skipped: a booting sibling engine's
+    workers open+lock their creator's file within moments, and the grace
+    period keeps the reaper away from that window. Regions created by
+    builds that predate flocking are indistinguishable from stale ones;
+    they are only safe to reap because deployments stop the old engine
+    before starting a new build.
+    """
+    reclaimed = 0
+    try:
+        names = os.listdir("/dev/shm")
+    except OSError:
+        return 0
+    for name in names:
+        if not (name.startswith("vllm_offload_") and name.endswith(".mmap")):
+            continue
+        path = os.path.join("/dev/shm", name)
+        if path == exclude_path:
+            continue
+        try:
+            if time.time() - os.stat(path).st_mtime < 60.0:
+                continue
+            fd = os.open(path, os.O_RDWR)
+        except OSError:
+            continue
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                continue  # lock held -> a live engine owns this region
+            for p in (path, path + ".meta"):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+            reclaimed += 1
+            logger.warning(
+                "Reclaimed stale KV offload region %s (no live owner holds "
+                "its lock)",
+                path,
+            )
+        finally:
+            os.close(fd)
+    return reclaimed
+
+
+
+def _interleave_across_numa_nodes(mm: mmap.mmap, length: int) -> None:
+    """mbind(MPOL_INTERLEAVE) the region across all online NUMA nodes.
+
+    Under the kernel's default first-touch policy every populated page
+    lands on the toucher's node, and all workers run next to their GPUs
+    on one socket. A region approaching that node's capacity starves it:
+    observed on a 2-node 2 TB box, 888 GiB of a 1 TiB region landed on
+    node0 (1009 GiB), leaving ~10 GiB free there, and the driver's
+    node-local allocations during cudaHostRegister then failed with
+    cudaErrorMemoryAllocation - a boot crash loop. Interleaving spreads
+    the footprint evenly; remote-socket DMA is slower but this is a
+    staging tier. Must run BEFORE population: mbind only affects pages
+    that are not yet allocated.
+    """
+    knob = os.environ.get("VLLM_KV_OFFLOAD_NUMA_INTERLEAVE", "auto")
+    if knob == "0":
+        return
+    if platform.machine() != "x86_64":
+        return
+    try:
+        online = open("/sys/devices/system/node/online").read().strip()
+    except OSError:
+        return
+    nodes: set[int] = set()
+    for part in online.split(","):
+        if "-" in part:
+            lo, hi = part.split("-")
+            nodes.update(range(int(lo), int(hi) + 1))
+        elif part:
+            nodes.add(int(part))
+    if len(nodes) < 2 or max(nodes) >= 64:
+        return
+    if knob != "1":
+        # auto: interleave ONLY when the region is big enough to threaten a
+        # single node. Small regions are better off with first-touch - each
+        # rank's slots land on its GPU-local node and transfers stay on-socket.
+        # Threshold: half the smallest node's capacity.
+        min_node_bytes = None
+        for n in nodes:
+            try:
+                with open(f"/sys/devices/system/node/node{n}/meminfo") as f:
+                    for line in f:
+                        if "MemTotal" in line:
+                            b = int(line.split()[-2]) * 1024
+                            if min_node_bytes is None or b < min_node_bytes:
+                                min_node_bytes = b
+                            break
+            except OSError:
+                return
+        if min_node_bytes is None or length < min_node_bytes // 2:
+            logger.info(
+                "Offload region (%.0f GB) fits comfortably in one NUMA node; "
+                "keeping first-touch placement for transfer locality "
+                "(set VLLM_KV_OFFLOAD_NUMA_INTERLEAVE=1 to force interleave)",
+                length / 1e9,
+            )
+            return
+    import ctypes
+
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    mask = 0
+    for n in nodes:
+        mask |= 1 << n
+    nodemask = (ctypes.c_ulong * 1)(mask)
+    buf = ctypes.c_char.from_buffer(mm)
+    try:
+        addr = ctypes.addressof(buf)
+        _SYS_MBIND = 237  # x86_64
+        _MPOL_INTERLEAVE = 3
+        ret = libc.syscall(
+            _SYS_MBIND,
+            ctypes.c_void_p(addr),
+            ctypes.c_size_t(length),
+            ctypes.c_int(_MPOL_INTERLEAVE),
+            nodemask,
+            ctypes.c_ulong(max(nodes) + 2),
+            ctypes.c_uint(0),
+        )
+    finally:
+        del buf
+    if ret != 0:
+        logger.warning(
+            "mbind(MPOL_INTERLEAVE) failed (errno=%d); offload region pages "
+            "will follow first-touch NUMA placement",
+            ctypes.get_errno(),
+        )
+    else:
+        logger.info(
+            "Offload region interleaved across NUMA nodes %s", sorted(nodes)
+        )
+
 
 
 def _wait_for_file_size(fd: int, expected_size: int, timeout: float = 30.0) -> None:
@@ -107,6 +260,7 @@ class SharedOffloadRegion:
             # Joiner path — another worker won O_EXCL. Reopen and wait
             # for the file to reach expected size.
             self.fd = os.open(self.mmap_path, os.O_RDWR)
+            fcntl.flock(self.fd, fcntl.LOCK_SH)
             try:
                 _wait_for_file_size(self.fd, self.total_size_bytes)
             except (TimeoutError, OSError):
@@ -119,6 +273,14 @@ class SharedOffloadRegion:
             # land on a 0-byte stub and spin in _wait_for_file_size
             # for the full 30 s timeout.
             try:
+                # Liveness lock (fork feature): every process holds a shared
+                # flock on its region file for the fd's lifetime; the kernel
+                # drops flocks on death (SIGKILL included), so the reaper can
+                # identify truly orphaned regions.
+                fcntl.flock(self.fd, fcntl.LOCK_SH)
+                # Reap regions leaked by dead engines BEFORE the free-space
+                # check so crash loops free their own garbage.
+                _reclaim_stale_regions(self.mmap_path)
                 check_shm_free_space(self.total_size_bytes)
                 os.ftruncate(self.fd, self.total_size_bytes)
             except (RuntimeError, OSError):
@@ -138,6 +300,10 @@ class SharedOffloadRegion:
             flags=mmap.MAP_SHARED,
             prot=mmap.PROT_READ | mmap.PROT_WRITE,
         )
+
+        # Spread a near-node-sized region across NUMA nodes before any page
+        # is touched (fork feature; auto-gated inside).
+        _interleave_across_numa_nodes(self.mmap_obj, self.total_size_bytes)
 
         populate_write_fn = _get_populate_write_fn(self.mmap_obj)
 
