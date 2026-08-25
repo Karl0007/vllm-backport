@@ -392,7 +392,13 @@ void fused_kda_decode(
     torch::stable::Tensor& out, std::optional<double> lower_bound,
     std::optional<torch::stable::Tensor> output_gate,
     std::optional<torch::stable::Tensor> norm_weight, double norm_eps);
+#endif
 
+// Guarded separately from the KDA decl above: the GDN kernel builds for
+// 8.x archs while KDA is 9.0a+ only, so a build whose arch list enables
+// GDN but not KDA (e.g. a single-arch sm86 image) needs this declaration
+// even though VLLM_ENABLE_FUSED_KDA_DECODE is undefined.
+#ifdef VLLM_ENABLE_FUSED_GDN_DECODE
 void fused_gdn_decode_post_conv_mtp(
     torch::stable::Tensor const& mixed_qkv, torch::stable::Tensor const& a,
     torch::stable::Tensor const& b, torch::stable::Tensor const& a_log,
