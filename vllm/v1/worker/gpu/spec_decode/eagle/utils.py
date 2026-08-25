@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 
-from vllm.config import VllmConfig, replace
+from vllm.config import CompilationMode, VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.lora.layers.base import BaseLayerWithLoRA
 from vllm.model_executor.model_loader import get_model
@@ -45,6 +45,18 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
             cache_config=replace(
                 vllm_config.cache_config,
                 cache_dtype=speculative_config.kv_cache_dtype,
+            ),
+        )
+    # enforce_eager on the speculative config must make the DRAFT eager too.
+    # Without this the draft inherits the target's VLLM_COMPILE mode; dynamo
+    # then fails on data-dependent asserts in some draft models (observed:
+    # Qwen3.5 MTP head), and concurrent draft+target AOT compiles race in
+    # TritonBundler's cache.
+    if speculative_config.enforce_eager:
+        vllm_config = replace(
+            vllm_config,
+            compilation_config=replace(
+                vllm_config.compilation_config, mode=CompilationMode.NONE
             ),
         )
     with set_model_tag("eagle_head"):
