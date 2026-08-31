@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # DSV4-Flash PP4+DSpark smoke on the unified vllm-backport base.
 # Flags mirror /opt/vllm170hx/launch/start-cmp170hx.sh (production, 98 tok/s
-# decode on the old f8ea5bb line). Model len shortened for smoke boot.
+# decode on the old f8ea5bb line), including the 1M context (ROW_CHUNK=64 is
+# the prerequisite for cumulative chats >700k, see handoff doc).
 set -euo pipefail
 
 MODEL_HOST_PATH="${MODEL_HOST_PATH:-/srv/models/DeepSeek-V4-Flash-0731}"
@@ -14,7 +15,7 @@ PP_PARTITION="${PP_PARTITION:-12,12,12,7}"
 NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-5}"
 GMU="${GMU:-0.85}"
 MAX_SEQS="${MAX_SEQS:-8}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-1048576}"
 CACHE_DIR="$(dirname "$0")/vllm_cache_dsv4"
 
 mkdir -p "${CACHE_DIR}/triton" "${CACHE_DIR}/tilelang"
