@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # Strict correctness battery for GLM-5.3-Flash (temperature 0).
 # Every check has a deterministic expected answer; run against a booted server.
-# Usage: ./verify_correctness.sh [PORT]
+# Usage: API_KEY=... ./verify_correctness.sh [PORT]  (PORT defaults 8007)
 set -uo pipefail
 PORT="${1:-8007}"
 BASE="http://localhost:${PORT}"
 MODEL="${MODEL_NAME:-glm-5.3-flash-nvfp4}"
+KEY="${API_KEY:-}"
 PASS=0; FAIL=0
 
 ask() {  # ask <json-escaped-user-msg> -> prints content only
   local msg="$1"
-  curl -s "${BASE}/v1/chat/completions" -H "Content-Type: application/json" -d "{
+  curl -s "${BASE}/v1/chat/completions" -H "Content-Type: application/json" ${KEY:+-H "Authorization: Bearer $KEY"} -d "{
     \"model\": \"${MODEL}\",
     \"messages\": [{\"role\": \"user\", \"content\": ${msg}}],
     \"temperature\": 0, \"max_tokens\": 1024,
@@ -40,7 +41,7 @@ if [[ "$d1" == "$d2" && -n "$d1" ]]; then echo "PASS  determinism  ($d1)"; PASS=
 else echo "FAIL  determinism  [$d1] vs [$d2]"; FAIL=$((FAIL+1)); fi
 
 # tool call round-trip
-curl -s "${BASE}/v1/chat/completions" -H "Content-Type: application/json" -d "{
+curl -s "${BASE}/v1/chat/completions" -H "Content-Type: application/json" ${KEY:+-H "Authorization: Bearer $KEY"} -d "{
   \"model\": \"${MODEL}\", \"temperature\": 0, \"max_tokens\": 512,
   \"messages\": [{\"role\": \"user\", \"content\": \"What is the weather in Shanghai? Use the get_weather tool.\"}],
   \"tools\": [{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Get weather for a city\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"]}}}]
