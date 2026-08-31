@@ -16,8 +16,13 @@ PP_PARTITION="${PP_PARTITION:-14,11,11,9}"
 NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-5}"
 GMU="${GMU:-0.95}"
 MAX_SEQS="${MAX_SEQS:-8}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-524288}"
+# NVFP4 (RedHatAI) needs moe-backend marlin (unquantized-MoE path); AWQ W4A16
+# checkpoints carry quantized MoE and must NOT pass it -> override with MOE_BACKEND=
+MOE_BACKEND="${MOE_BACKEND-marlin}"
 CACHE_DIR="$(dirname "$0")/vllm_cache"
+NAME="${NAME:-glm53-cmp170hx}"
+SERVED_NAME="${SERVED_NAME:-glm-5.3-flash-nvfp4}"
 
 SPEC_ARGS=()
 if [ "${NUM_SPEC_TOKENS}" -gt 0 ]; then
@@ -28,7 +33,7 @@ mkdir -p "${CACHE_DIR}/triton" "${CACHE_DIR}/tilelang"
 
 serve() {
 sudo docker run --rm \
-  --name glm53-cmp170hx \
+  --name ${NAME} \
   --gpus all \
   -e CUDA_VISIBLE_DEVICES=0,1,2,3 \
   --privileged --ipc=host \
@@ -48,12 +53,12 @@ sudo docker run --rm \
   -e VLLM_LOGGING_LEVEL=INFO \
   ${IMAGE} \
   "${MODEL_CONTAINER_PATH}" \
-  --served-model-name glm-5.3-flash-nvfp4 \
+  --served-model-name ${SERVED_NAME} \
   ${API_KEY:+--api-key} ${API_KEY:+"$API_KEY"} \
   --tensor-parallel-size ${TP} \
   --pipeline-parallel-size ${PP} \
   --enable-expert-parallel \
-  --moe-backend marlin \
+  ${MOE_BACKEND:+--moe-backend ${MOE_BACKEND}} \
   --gpu-memory-utilization ${GMU} \
   --max-num-seqs ${MAX_SEQS} \
   --max-model-len ${MAX_MODEL_LEN} \
@@ -72,8 +77,8 @@ serve "$@" &
 CPID=$!
 # Orchestrator stops the worker's process group; make sure the (detached)
 # docker CLI does not keep the --rm container running after we exit.
-trap 'sudo docker stop glm53-cmp170hx >/dev/null 2>&1 || true' TERM INT
+trap 'sudo docker stop ${NAME} >/dev/null 2>&1 || true' TERM INT
 wait "$CPID"
 RC=$?
-sudo docker stop glm53-cmp170hx >/dev/null 2>&1 || true
+sudo docker stop ${NAME} >/dev/null 2>&1 || true
 exit $RC
