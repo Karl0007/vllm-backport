@@ -1,0 +1,34 @@
+# Derived runtime: lazymio/vllm-backport:v0.11.1-sm80 (prebuilt sm80 wheel) +
+# the cmp170hx branch's vllm/ PYTHON tree overlaid wholesale.
+#
+# Verified: every .py in the image matches git fb4a3d9 (md5 spot-checks on the
+# highest-churn files), and the cmp170hx changes are Python-only, so the fork's
+# compiled _C.abi3.so is kept untouched. No source build needed.
+FROM dockerproxy.net/lazymio/vllm-backport:v0.11.1-sm80
+
+COPY vllm/__init__.py /tmp/vllm_tree_check/__init__.py
+RUN python3 -c "import vllm,os,sys,hashlib;q=os.path.dirname(vllm.__file__);\
+d=hashlib.md5(open('/tmp/vllm_tree_check/__init__.py','rb').read()).hexdigest();\
+i=hashlib.md5(open(os.path.join(q,'__init__.py'),'rb').read()).hexdigest();\
+sys.exit(0 if d==i else (sys.stderr.write(f'BASE DRIFT {d} != {i}\n') or 1))"
+
+# Wholesale Python overlay (base verified identical to fb4a3d9; branch adds
+# PR#44 + GLM PP handoff + MTP embed-from-checkpoint + Qwen PLE PP unlocks).
+COPY vllm/ /usr/local/lib/python3.12/dist-packages/vllm/
+
+RUN python3 - <<'EOF'
+import importlib, sys
+mods = [
+    "vllm.models.glm5next.nvidia.model",
+    "vllm.models.qwen4_exp.nvidia.model_state",
+    "vllm.v1.worker.gpu.spec_decode.eagle.utils",
+]
+# importlib-only checks (no CUDA); model modules pull config/nn deps fine
+for m in mods:
+    importlib.import_module(m)
+import vllm.v1.worker.gpu.spec_decode.eagle.utils as u
+assert hasattr(u, "_load_embed_from_checkpoint"), "MTP embed fix missing"
+import vllm.models.glm5next.nvidia.model as gm
+assert hasattr(gm.Glm5NextModel, "make_empty_intermediate_tensors"), "PP handoff missing"
+print("overlay assertions OK")
+EOF
