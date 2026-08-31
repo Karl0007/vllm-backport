@@ -800,6 +800,10 @@ class DeepseekV4MoE(nn.Module):
         self.gate.tid2eid = None
         is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers
         self.hash_indices_dtype = torch.int64 if self.use_mega_moe else torch.int32
+        # Vision checkpoints carry a gate bias on the hash layers too (the
+        # vision-aware router falls back to score+bias top-k for image tokens),
+        # so allocate it even though text-only routing never reads it.
+        is_vision_ckpt = getattr(config, "vision_n_layers", 0) > 0
         if is_hash_moe:
             # hash MoE doesn't use e_score_correction_bias
             # Use randint instead of empty to avoid garbage values causing
@@ -813,7 +817,9 @@ class DeepseekV4MoE(nn.Module):
                 ),
                 requires_grad=False,
             )
-        elif getattr(config, "topk_method", None) == "noaux_tc":
+        if (not is_hash_moe or is_vision_ckpt) and getattr(
+            config, "topk_method", None
+        ) == "noaux_tc":
             self.gate.e_score_correction_bias = nn.Parameter(
                 torch.empty(config.n_routed_experts, dtype=torch.float32),
                 requires_grad=False,
@@ -1854,8 +1860,24 @@ class DeepseekV4ForCausalLM(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        mapper = self.hf_to_vllm_mapper | WeightsMapper(
-            orig_to_new_substr={"mtp.": None}
+        # TODO(vision): DeepSeek-V4-Flash-Vision-Exp ships a ViT + aligner, four
+        # sentinel embeddings and a per-layer vision expert bias. Until the
+        # vision path exists, drop them so the (unchanged) text backbone still
+        # loads from a vision checkpoint. These must be matched before
+        # hf_to_vllm_mapper, whose ".ffn.gate.bias" substring also matches
+        # ".ffn.gate.bias_vl".
+        vision_skip = WeightsMapper(
+            orig_to_new_substr={
+                ".ffn.gate.bias_vl": None,
+                "vision.": None,
+                "aligner.": None,
+                "image_": None,
+            }
+        )
+        mapper = (
+            vision_skip
+            | self.hf_to_vllm_mapper
+            | WeightsMapper(orig_to_new_substr={"mtp.": None})
         )
         return loader.load_weights(weights, mapper=mapper)
 
