@@ -1,10 +1,11 @@
-# Derived runtime: lazymio/vllm-backport:v0.11.1-sm80 (prebuilt sm80 wheel) +
+# Derived runtime: lazymio/vllm-backport:v0.11.2-sm80 (prebuilt sm80 wheel) +
 # the cmp170hx branch's vllm/ PYTHON tree overlaid wholesale.
 #
 # Verified: every .py in the image matches git fb4a3d9 (md5 spot-checks on the
 # highest-churn files), and the cmp170hx changes are Python-only, so the fork's
 # compiled _C.abi3.so is kept untouched. No source build needed.
-FROM dockerproxy.net/lazymio/vllm-backport:v0.11.1-sm80
+# v0.11.2 = origin/master tag (PR#44+#47+#49 merged); branch rebased onto it.
+FROM dockerproxy.net/lazymio/vllm-backport:v0.11.2-sm80
 
 COPY vllm/__init__.py /tmp/vllm_tree_check/__init__.py
 RUN python3 -c "import vllm,os,sys,hashlib;q=os.path.dirname(vllm.__file__);\
