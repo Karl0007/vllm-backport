@@ -72,7 +72,7 @@ Consequence for our capture: the worker tap is a **forward hook on the output of
 not a pre-hook on its input. Only calls with exactly 2048 rows are kept, and the
 last row is dropped, so our lane has the same `[2047, 4096]` shape as theirs.
 
-## dtype is part of the protocol (measured, not assumed)
+## dtype is part of the protocol (match it, don't "improve" it)
 
 Replaying the shared head in **float32 does not reproduce the published rows**.
 On the first 30 contexts:
@@ -82,14 +82,18 @@ On the first 30 contexts:
 | float32 | 1.17e-2 | 1.00e-2 |
 | **bfloat16** | **5.89e-5** | **3.49e-5** |
 
-So the suite multiplies `[2047,4096] × [4096,154880]` in **bf16**, exactly the
-dtype the tensors are stored in, and the residual 1e-4-level differences are GEMM
-accumulation order. The mechanism for the fp32 gap is real and measurable: bf16
-logits carry ~0.08 nats of rounding noise, which *inflates* KL by ~0.003 nats
-(about 10% at this KL, verified with a synthetic same-distribution pair). Using
-fp32 for our own row would therefore make AWQ look ~1-4% better than every
-published row for a reason that has nothing to do with AWQ. The harness defaults
-to bf16 and the anchor gate is what proves the choice.
+So the published rows are a **bf16 matmul**, exactly the dtype the tensors are stored in;
+the residual 1e-4-level differences are GEMM accumulation order. Mechanism: bf16 logits carry
+~0.08 nats of rounding noise, which *inflates* KL by ~0.003 nats (~10% here, verified with a
+synthetic same-distribution pair).
+
+This is a protocol-match rule, not a correctness rule, and the distinction matters: the suite's
+own README reports an independent cross-validation against a **separate full-vocab fp32**
+pipeline (brandonmusic BF16 teacher logits) agreeing with theirs at **1.27e-2** over 51,175
+positions -- the same order as our fp32-vs-published 1.17e-2. fp32 replay is a legitimate
+protocol; it just is not the one the table was computed with. Anchoring in fp32 would therefore
+not be "wrong", it would be a different yardstick -- and one with a second decimal digit of slop
+against the rows we compare to. The harness defaults to bf16 so the anchor gate can be tight.
 
 ## Head equality
 
@@ -154,13 +158,33 @@ no cards. The FP8 lane is likewise partial (243 shards), which is why the anchor
 `d(AWQ, official-FP8-lane) = 0.0836` over the 49 shared source clusters -- larger than
 `d(AWQ, BF16) = 0.0770`, i.e. our error is *independent* of FP8's, not an FP8-like perturbation.
 
-**What the number includes**: quantization **plus** our engine (PP4 + mHC handoff, eager capture),
-against a teacher captured on a different engine. The published engine-drift figure for a native
-BF16 recapture is 0.0115 nats (vcruz2, full scope). We hold no BF16 GLM-5.3-Flash weights, so we
-cannot subtract an engine term: **0.077 is an upper bound on the AWQ quantization error**, not a
-decomposition. GSM8K-100 = 99/100 on the same weights: 9.2% of positions disagree with the
-teacher's argmax and the tail (p999 = 3.17 nats) carries most of the distance, which is why a
-pass@1 benchmark does not see it.
+**The engine term is bounded, not unknown.** We hold no BF16 GLM-5.3-Flash weights, so we cannot
+measure our own drift directly -- but the suite publishes theirs, measured on this same architecture
+(`glm5_next`), and it is the number to spend:
+
+| published receipt (their README "Receipts" / "Known issue") | value |
+|---|---|
+| run-to-run floor, same engine, through the shared head | **8.7e-4** mean KLD (top-1 0.9946) |
+| live-vs-replayed, third engine launch, through the model | **1.49e-2** mean KLD (top-1 0.95695) |
+| independent pipeline (different code, full-vocab fp32) vs theirs | **1.27e-2** mean KLD (top-1 0.96653) |
+
+Root cause is documented and engine-level, not weight-level: per-process Triton autotune winner
+selection on the vendored FLA/KDA chunk kernels changes fp32 reduction splits, amplified by DSA
+`index_topk` membership flips (fla-org/flash-linear-attention#945, triton-lang/triton#9368).
+Their own conclusion: paired comparisons share the replay path and carry only the 8.7e-4 floor,
+while **absolute as-served claims carry the ~1.5e-2 bound** -- which is our situation.
+
+So 0.0770 - ~0.015 leaves **~0.062 attributable to the weights**, still 2.3x the FP8 row: the
+AWQ-vs-FP8 ordering does not depend on the engine term at any plausible value of it. What the
+drift term does change is the *fine* reading -- two candidates within ~0.015 of each other are not
+separable by this protocol on this architecture. Deterministic rerun recipe (theirs, not yet
+applied to our capture): `TRITON_CACHE_AUTOTUNING=1` with a persistent `TRITON_CACHE_DIR`, or pin
+the vendored FLA autotune lists to a single `num_warps=2` config. Our capture ran with
+`enable_flashinfer_autotune: false` only, so we carry the full ~1.5e-2 bound.
+
+Their receipts also warn that KLD depends on which positions are scored (their own headline drops
+0.0281 -> 0.0188 when restricted to positions 1024+), which is why the scored window is printed on
+every report and compared index-for-index against the published per-context arrays.
 
 ## Running it
 
