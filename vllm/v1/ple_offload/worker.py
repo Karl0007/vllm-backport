@@ -155,6 +155,13 @@ def _init_offload_distributed() -> None:
             pipeline_model_parallel_size=1,
             backend="gloo",
         )
+    # The offload process owns the whole model as a single PP rank, but it
+    # inherits the GPU workers' VLLM_PP_LAYER_PARTITION (e.g. "12,12,12,12"
+    # for PP4). get_pp_indices validates len(partitions) == pp_size against
+    # get_pp_group().world_size (=1 here), so that var must be cleared or
+    # the offload worker aborts with "len(partitions)=4 does not match
+    # pp_size=1" (seen on Qwen3.8-Flash-Next PP4 + PLE offload).
+    envs.VLLM_PP_LAYER_PARTITION = None
     logger.info(
         "Distributed environment initialized (backend=gloo, rank=0, world_size=1)."
     )
