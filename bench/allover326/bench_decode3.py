@@ -7,12 +7,17 @@ not a measurement. Technical exposition is highly predictable (draft hits),
 open-ended prose is not (draft misses), code sits in between.
 """
 import json
+import os
 import sys
 import time
 import urllib.request
 
-URL = "http://127.0.0.1:8098/v1/completions"
-MODEL = "dsv4s"
+URL = os.environ.get("BENCH_URL", "http://127.0.0.1:8098/v1/completions")
+MODEL = os.environ.get("BENCH_MODEL", "dsv4s")
+_KEY = os.environ.get("BENCH_KEY", "")
+HDRS = {"Content-Type": "application/json"}
+if _KEY:
+    HDRS["Authorization"] = f"Bearer {_KEY}"
 
 PROMPTS = {
     "technical": (
@@ -41,7 +46,7 @@ def run(tag, max_tokens=400):
             json.dumps(
                 {"model": MODEL, "prompt": p, "max_tokens": max_tokens, "temperature": 0}
             ).encode(),
-            {"Content-Type": "application/json"},
+            HDRS,
         )
         t0 = time.perf_counter()
         resp = json.load(urllib.request.urlopen(req, timeout=1800))
