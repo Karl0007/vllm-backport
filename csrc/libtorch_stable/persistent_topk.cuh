@@ -728,6 +728,26 @@ __device__ void radix_topk(const float* __restrict__ row_input,
   {
     const uint32_t aligned_size = (actual_chunk_size / VEC_SIZE) * VEC_SIZE;
 
+    // Kernel-side alignment guard: the vectorized reinterpret_cast below is
+    // only legal when the absolute address is 16B(8B)-aligned. The host picks
+    // VEC_SIZE from stride % 4 and rounds chunk starts to VEC_SIZE, so the
+    // invariant holds today — but it silently depends on row_input being
+    // 16B-aligned (stride % 4 == 0 for every row). Any future caller passing
+    // a non-multiple-of-4 stride, a strided logits slice, or an odd row
+    // offset would make this cast a misaligned-address fault (Xid 13) on the
+    // *first* long row. Guard with a device-side trap so the contract
+    // violation surfaces as a named error instead of silent corruption.
+    const uintptr_t row_addr = reinterpret_cast<uintptr_t>(row_input);
+    // Fail-fast: misalignment means an upstream layout change broke the
+    // caller's contract (stride % 4 for every row). Fix belongs at the
+    // source, not here — degrade loudly instead of silently running slow.
+    const bool row_vec4_ok =
+        VEC_SIZE == 4 ? (row_addr & 0xFu) == 0u
+                      : (VEC_SIZE == 2 ? (row_addr & 0x7u) == 0u : true);
+    if (!row_vec4_ok) {
+        __trap();  // vector-load alignment contract violated
+    }
+
     for (uint32_t i = tx * VEC_SIZE; i < aligned_size;
          i += kThreadsPerBlock * VEC_SIZE) {
       const float* src = row_input + my_chunk_start + i;
@@ -1206,6 +1226,16 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
   // Short path
   if (length <= 32768) {
     extern __shared__ uint8_t _smem_reg[];
+    // Kernel-side alignment guard: histogram_4096_topk (non-predicated) does
+    // raw `reinterpret_cast<const float4*>` loads. Host dispatch picks
+    // vec_size from gcd(max_len, 4) and torch allocations give `input` 256B
+    // alignment, so `score = input + bid*max_len` is 16B-aligned only while
+    // max_len % 4 == 0. A caller passing a non-multiple-of-4 width (ragged
+    // logits buffer, sub-slice, changed output layout) violates that
+    // contract — trap with the kernel name instead of faulting blind.
+    if ((reinterpret_cast<uintptr_t>(score) & 0xFu) != 0u) {
+      __trap();  // vector-load alignment contract violated
+    }
     if constexpr (UsePredicatedShortLoads) {
       hist4096::histogram_4096_topk_predicated<MAX_K, 12, 8>(score, dst, length,
                                                              _smem_reg);
@@ -1237,7 +1267,18 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
 
   vec_t<DType, VEC_SIZE> score_vec;
 
-  const int aligned_length = (length / VEC_SIZE) * VEC_SIZE;
+  // Kernel-side alignment guard: score = input + bid*max_len is 16B-aligned
+  // only while max_len % 4 == 0 (host picks VEC_SIZE from gcd(max_len, 4) and
+  // torch gives `input` 256B alignment). If a caller breaks that chain, the
+  // compiler's vectorization of the unrolled cast_load below (and of any
+  // ld.global.v4 it emits) faults with a misaligned-address Xid 13. Trap
+  // with the kernel name instead of faulting blind or running slow.
+  if ((reinterpret_cast<uintptr_t>(score) & 0xFu) != 0u) {
+    __trap();  // vector-load alignment contract violated
+  }
+
+  const int aligned_length =
+      (length / VEC_SIZE) * VEC_SIZE;
 #pragma unroll 2
   for (int base = tx * VEC_SIZE; base < aligned_length;
        base += BLOCK_SIZE * VEC_SIZE) {
