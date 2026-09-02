@@ -723,6 +723,16 @@ __global__ void cp_gather_indexer_k_quant_cache_kernel(
   const int64_t src_inblock_offset = src_block_offset + cache_inblock_offset;
   const int64_t dst_inblock_offset = token_idx * token_stride + head_idx;
 
+  // Kernel-side alignment guard. The float4 copies below require both
+  // absolute addresses to be 16B-aligned. Today that holds through layout
+  // coincidence (head_dim=128, block_stride=512*132 %16==0, torch 256B
+  // base alignment) — nothing checks it. Any layout change (different
+  // head_dim, padded cache stride, sub-sliced dst_k) violates the contract:
+  // trap with the kernel name instead of faulting blind.
+  if ((reinterpret_cast<uintptr_t>(kv_cache + src_inblock_offset) & 0xFu) != 0u ||
+      (reinterpret_cast<uintptr_t>(dst_k + dst_inblock_offset) & 0xFu) != 0u) {
+    __trap();  // vector-copy alignment contract violated
+  }
   reinterpret_cast<float4*>(dst_k)[dst_inblock_offset / VEC_SIZE] =
       reinterpret_cast<const float4*>(kv_cache)[src_inblock_offset / VEC_SIZE];
   ;
