@@ -51,6 +51,34 @@ fi
 
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-$MAXLEN_DEFAULT}"
 
+# Static YaRN rope scaling. The checkpoint is natively 262144 (config.json
+# rope_type=default); the vendor README prescribes YaRN only to go BEYOND that
+# (factor = target_len / 262144, e.g. 4.0 for 1M) and warns that static YaRN
+# "potentially impact[s] performance on shorter texts" -- every position is
+# compressed by `factor`, so at/below native length it is pure loss.
+# Hence: auto = scale only when MAX_MODEL_LEN exceeds native. YARN=0/1 forces.
+# The override replaces text_config.rope_parameters wholesale, so it must carry
+# the non-YaRN fields (mrope/partial_rotary/theta) from config.json too.
+NATIVE_MAX_POS=262144
+YARN="${YARN:-auto}"
+YARN_FACTOR="${YARN_FACTOR:-}"
+if [ "$YARN" = "auto" ]; then
+  if [ "$MAX_MODEL_LEN" -gt "$NATIVE_MAX_POS" ]; then YARN=1; else YARN=0; fi
+fi
+ROPE_ARGS=(); LONGLEN_ENV=()
+if [ "$YARN" = "1" ]; then
+  if [ -z "$YARN_FACTOR" ]; then
+    if [ "$MAX_MODEL_LEN" -le "$NATIVE_MAX_POS" ]; then
+      echo "YARN=1 with MAX_MODEL_LEN=$MAX_MODEL_LEN (<= native $NATIVE_MAX_POS) needs an explicit YARN_FACTOR; unset YARN to go back to native rope." >&2
+      exit 1
+    fi
+    YARN_FACTOR=$(awk -v m="$MAX_MODEL_LEN" -v n="$NATIVE_MAX_POS" 'BEGIN{printf "%.4f", m/n}')
+  fi
+  # vLLM rejects max_model_len > hf max_position_embeddings without this.
+  LONGLEN_ENV=(-e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1)
+  ROPE_ARGS=(--hf-overrides "{\"text_config\": {\"rope_parameters\": {\"mrope_interleaved\": true, \"mrope_section\": [11, 11, 10], \"rope_type\": \"yarn\", \"rope_theta\": 10000000, \"partial_rotary_factor\": 0.25, \"factor\": $YARN_FACTOR, \"original_max_position_embeddings\": $NATIVE_MAX_POS}}}")
+fi
+
 SPEC_ARGS=()
 if [ "$NUM_SPEC" -gt 0 ]; then
   SPEC_ARGS=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$NUM_SPEC}")
@@ -70,6 +98,7 @@ sudo docker run --rm \
   -e VLLM_PP_LAYER_PARTITION="$PP_PARTITION" \
   -e PYTHONUNBUFFERED=1 -e VLLM_LOGGING_LEVEL=INFO \
   "${PLE_ENV[@]}" \
+  "${LONGLEN_ENV[@]}" \
   -p "$PORT:8000" \
   -v "$MODEL_HOST_PATH":"$MODEL_CONTAINER_PATH":ro \
   -v "$CACHE_DIR":/root/.cache/vllm \
@@ -88,7 +117,7 @@ sudo docker run --rm \
   --mamba-cache-mode align \
   "${SPEC_ARGS[@]}" \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}' \
-  --hf-overrides '{"text_config": {"rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144}}}' \
+  "${ROPE_ARGS[@]}" \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_xml \
   --reasoning-parser qwen3 \
