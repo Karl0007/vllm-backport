@@ -20,6 +20,11 @@ MODEL_HOST_PATH="${MODEL_HOST_PATH:-/srv/models/Qwen/Qwen3.8-Flash-Next-FP8}"
 MODEL_CONTAINER_PATH="/models/qwen38"
 PORT="${PORT:-8010}"
 API_KEY="${API_KEY:-}"
+# B5(fail-open 修复)：API key 未设置时拒绝启动而不是起一个 0.0.0.0 发布、完全无鉴权的 vLLM。
+if [ -z "$API_KEY" ]; then
+  echo "ERROR: API_KEY 未设置（orchestrator profile 的 env 应该传它）——拒绝启动无鉴权 worker" >&2
+  exit 1
+fi
 IMAGE="${IMAGE:-vllm/vllm-backport:cmp170hx}"
 GMU="${GMU:-0.90}"
 NUM_SPEC="${NUM_SPEC:-3}"
@@ -99,7 +104,7 @@ sudo docker run --rm \
   -e PYTHONUNBUFFERED=1 -e VLLM_LOGGING_LEVEL=INFO \
   "${PLE_ENV[@]}" \
   "${LONGLEN_ENV[@]}" \
-  -p "$PORT:8000" \
+  -p "127.0.0.1:$PORT:8000" \
   -v "$MODEL_HOST_PATH":"$MODEL_CONTAINER_PATH":ro \
   -v "$CACHE_DIR":/root/.cache/vllm \
   -v "$CACHE_DIR/triton":/root/.cache/triton \

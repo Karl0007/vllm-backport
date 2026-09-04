@@ -9,6 +9,11 @@ MODEL_HOST_PATH="${MODEL_HOST_PATH:-/srv/models/RedHatAI/GLM-5.3-Flash-NVFP4}"
 MODEL_CONTAINER_PATH="/models/GLM-5.3-Flash-NVFP4"
 PORT="${PORT:-8009}"
 API_KEY="${API_KEY:-}"
+# B5(fail-open 修复)：API key 未设置时拒绝启动而不是起一个 0.0.0.0 发布、完全无鉴权的 vLLM。
+if [ -z "$API_KEY" ]; then
+  echo "ERROR: API_KEY 未设置（orchestrator profile 的 env 应该传它）——拒绝启动无鉴权 worker" >&2
+  exit 1
+fi
 IMAGE="${IMAGE:-vllm/vllm-backport:cmp170hx}"
 TP="${TP:-1}"
 PP="${PP:-4}"
@@ -37,7 +42,7 @@ sudo docker run --rm \
   --gpus all \
   -e CUDA_VISIBLE_DEVICES=0,1,2,3 \
   --privileged --ipc=host \
-  -p ${PORT}:8000 \
+  -p 127.0.0.1:${PORT}:8000 \
   -v "${MODEL_HOST_PATH}:${MODEL_CONTAINER_PATH}:ro" \
   -v "${CACHE_DIR}:/root/.cache/vllm" \
   -v "${CACHE_DIR}/triton:/root/.cache/triton" \
