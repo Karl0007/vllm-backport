@@ -478,7 +478,17 @@ def postprocess_mamba_fused_kernel(
     if src_block_idx == dest_block_idx and accept_token_bias == 0:
         return
 
-    bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
+    # The captured block tables are the SOURCE per-request-slot tables
+    # (persistent [max_num_reqs, max_blocks], mutated only by stream-ordered
+    # staged writes), so rows are always request-state slots -- index them by
+    # req_idx. Indexing by batch row read the CURRENT step's table at a stale
+    # batch mapping: on a non-last PP rank the deferred postprocess runs
+    # pp_size steps after its batch was gathered, so batch rows point at
+    # DIFFERENT requests and the state copy walks another request's
+    # freed/reallocated block ids. In the CSA unified layout every cache
+    # tensor aliases the same page, which is how foreign bytes landed in the
+    # PLE conv state (all-NaN logits -> constant-token loops; vllm#54173).
+    bt_row_idx = req_idx
     _copy_mamba_state_block(
         state_idx,
         bt_row_idx,
@@ -612,7 +622,8 @@ def precopy_mamba_align_fused_kernel(
     token_bias = tl.load(token_bias_ptr + req_idx)
     _copy_mamba_state_block(
         state_idx,
-        batch_idx,
+        # Source tables are req-indexed (see postprocess_mamba_fused_kernel).
+        req_idx,
         src_col,
         dst_col,
         token_bias,
