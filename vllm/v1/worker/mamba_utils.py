@@ -393,8 +393,9 @@ def postprocess_mamba_fused_kernel(
     # Output: num_accepted_tokens update (for src==dst case)
     num_accepted_tokens_out_ptr,
     # Optional: batch_idx -> req_idx mapping (V2 model runner / PP). The
-    # per-request decision arrays are in req-state-slot order; the block table
-    # is in batch order, so HAS_IDX_MAPPING splits the two indexings.
+    # per-request decision arrays AND the block tables are both in req-state-slot
+    # order, so rows are always indexed by req_idx; HAS_IDX_MAPPING only selects
+    # how a grid program (batch order) resolves its request slot.
     idx_mapping_ptr,
     # Runtime parameter (varies per batch - NOT constexpr to avoid recompilation)
     num_reqs,
