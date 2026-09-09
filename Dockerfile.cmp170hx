@@ -55,5 +55,15 @@ assert "max_length = max(0, max_length - kv_cache_spec.block_size)" in sm, (
 # vllm#53142 (no upstream PR): state-seed divisor = mamba group block size.
 mh = read("v1", "worker", "gpu", "model_states", "mamba_hybrid.py")
 assert "// mamba_bs" in mh, "mamba state seed uses CLI block size divisor"
+# 09-10 xgrammar FSM desync ports. #55223 (upstream main 09-08): reasoning-end
+# detection must use the offset scan, not the old per-token full-history sim.
+so = read("v1", "structured_output", "__init__.py")
+assert "find_reasoning_end_offset" in so, "#55223 reasoning-offset scan missing"
+# #45015 (upstream PR, open): deferred bitmask must drain in-flight batches
+# until structured FSMs catch up, else PP+async samples from a stale FSM.
+sc = read("v1", "core", "sched", "scheduler.py")
+ec = read("v1", "engine", "core.py")
+assert "def has_structured_output_in_flight" in sc, "#45015 scheduler hook missing"
+assert "has_structured_output_in_flight(" in ec, "#45015 bitmask drain missing"
 print("overlay assertions OK")
 EOF
