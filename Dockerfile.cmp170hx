@@ -1,0 +1,69 @@
+# Derived runtime: lazymio/vllm-backport:v0.11.2-sm80 (prebuilt sm80 wheel) +
+# the cmp170hx branch's vllm/ PYTHON tree overlaid wholesale.
+#
+# Verified: every .py in the image matches git fb4a3d9 (md5 spot-checks on the
+# highest-churn files), and the cmp170hx changes are Python-only, so the fork's
+# compiled _C.abi3.so is kept untouched. No source build needed.
+# v0.11.2 = origin/master tag (PR#44+#47+#49 merged); branch rebased onto it.
+FROM dockerproxy.net/lazymio/vllm-backport:v0.11.2-sm80
+
+COPY vllm/__init__.py /tmp/vllm_tree_check/__init__.py
+RUN python3 -c "import vllm,os,sys,hashlib;q=os.path.dirname(vllm.__file__);\
+d=hashlib.md5(open('/tmp/vllm_tree_check/__init__.py','rb').read()).hexdigest();\
+i=hashlib.md5(open(os.path.join(q,'__init__.py'),'rb').read()).hexdigest();\
+sys.exit(0 if d==i else (sys.stderr.write(f'BASE DRIFT {d} != {i}\n') or 1))"
+
+# Wholesale Python overlay (base verified identical to fb4a3d9; branch adds
+# PR#44 + GLM PP handoff + MTP embed-from-checkpoint + Qwen PLE PP unlocks).
+COPY vllm/ /usr/local/lib/python3.12/dist-packages/vllm/
+
+RUN python3 - <<'EOF'
+import importlib, os, sys
+mods = [
+    "vllm.models.glm5next.nvidia.model",
+    "vllm.models.qwen4_exp.nvidia.model_state",
+    "vllm.v1.worker.gpu.spec_decode.eagle.utils",
+]
+# importlib-only checks (no CUDA); model modules pull config/nn deps fine
+for m in mods:
+    importlib.import_module(m)
+import vllm.v1.worker.gpu.spec_decode.eagle.utils as u
+assert hasattr(u, "_load_embed_from_checkpoint"), "MTP embed fix missing"
+import vllm.models.glm5next.nvidia.model as gm
+assert hasattr(gm.Glm5NextModel, "make_empty_intermediate_tensors"), "PP handoff missing"
+# PP + MTP + prefix-caching state-corruption fix ('duct' loops / all-NaN
+# logits): the mamba spec-decode copy kernels must index the SOURCE req-indexed
+# block tables by req_idx, and the V2 runner must bind the ctx to those source
+# tables rather than the per-step gathered views. Text checks (not inspect)
+# because the kernels are triton JIT objects.
+root = os.path.dirname(importlib.import_module("vllm").__file__)
+read = lambda *p: open(os.path.join(root, *p)).read()
+mu = read("v1", "worker", "mamba_utils.py")
+assert "bt_row_idx = req_idx" in mu, "mamba postprocess still indexes batch rows"
+assert "HAS_IDX_MAPPING else req_idx" not in mu, "stale batch-row indexing is back"
+assert "req_idx,\n        src_col," in mu, "mamba precopy still indexes batch rows"
+mr = read("v1", "worker", "gpu", "model_runner.py")
+assert "tuple(bt.gpu for bt in self.block_tables.block_tables)" in mr, (
+    "mamba ctx not bound to source block tables"
+)
+# vllm#48375 (unmerged): MambaManager must honour drop_eagle_block, else a
+# prefix-cache resume lands on state snapshotted over rejected draft tokens.
+sm = read("v1", "core", "single_type_kv_cache_manager.py")
+assert "max_length = max(0, max_length - kv_cache_spec.block_size)" in sm, (
+    "MambaManager ignores drop_eagle_block"
+)
+# vllm#53142 (no upstream PR): state-seed divisor = mamba group block size.
+mh = read("v1", "worker", "gpu", "model_states", "mamba_hybrid.py")
+assert "// mamba_bs" in mh, "mamba state seed uses CLI block size divisor"
+# 09-10 xgrammar FSM desync ports. #55223 (upstream main 09-08): reasoning-end
+# detection must use the offset scan, not the old per-token full-history sim.
+so = read("v1", "structured_output", "__init__.py")
+assert "find_reasoning_end_offset" in so, "#55223 reasoning-offset scan missing"
+# #45015 (upstream PR, open): deferred bitmask must drain in-flight batches
+# until structured FSMs catch up, else PP+async samples from a stale FSM.
+sc = read("v1", "core", "sched", "scheduler.py")
+ec = read("v1", "engine", "core.py")
+assert "def has_structured_output_in_flight" in sc, "#45015 scheduler hook missing"
+assert "has_structured_output_in_flight(" in ec, "#45015 bitmask drain missing"
+print("overlay assertions OK")
+EOF
