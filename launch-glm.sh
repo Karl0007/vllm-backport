@@ -14,7 +14,7 @@ if [ -z "$API_KEY" ]; then
   echo "ERROR: API_KEY 未设置（orchestrator profile 的 env 应该传它）——拒绝启动无鉴权 worker" >&2
   exit 1
 fi
-IMAGE="${IMAGE:-vllm/vllm-backport:cmp170hx-v013}"
+IMAGE="${IMAGE:-vllm/vllm-backport:cmp170hx}"
 TP="${TP:-1}"
 PP="${PP:-4}"
 PP_PARTITION="${PP_PARTITION:-14,11,11,9}"
@@ -49,6 +49,7 @@ sudo docker run --rm \
   -v "${CACHE_DIR}/tilelang:/root/.cache/tilelang" \
   -e VLLM_TEST_FORCE_FP8_MARLIN=1 \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  -e VLLM_ATTENTION_BACKEND=TRITON_MLA_SPARSE \
   -e VLLM_PP_LAYER_PARTITION=${PP_PARTITION} \
   -e VLLM_ENGINE_READY_TIMEOUT_S=3600 \
   -e HF_HUB_OFFLINE=1 \
