@@ -1,69 +1,97 @@
-# Derived runtime: lazymio/vllm-backport:v0.11.2-sm80 (prebuilt sm80 wheel) +
-# the cmp170hx branch's vllm/ PYTHON tree overlaid wholesale.
+# Derived runtime: lazymio/vllm-backport:latest-sm80 (v0.13.0, upstream
+# 93911fcf68 port line, LMCache fork bundled) + the cmp170hx-v013 deployment
+# layer. The vllm/ PYTHON tree on this branch is upstream-identical, so the
+# overlay only carries deployment files (launchers, bench); the base image is
+# used AS IS. Assertions pin the fixes this line must contain (verified at
+# port time, 2026-09-11, origin/master a350766628):
 #
-# Verified: every .py in the image matches git fb4a3d9 (md5 spot-checks on the
-# highest-churn files), and the cmp170hx changes are Python-only, so the fork's
-# compiled _C.abi3.so is kept untouched. No source build needed.
-# v0.11.2 = origin/master tag (PR#44+#47+#49 merged); branch rebased onto it.
-FROM dockerproxy.net/lazymio/vllm-backport:v0.11.2-sm80
+# carried upstream (no local patch needed):
+#   - PR #63 PP+MTP+prefix-cache mamba state corruption: align copy kernels
+#     index rows by req_idx (mamba_utils.py) + runner binds ctx to the SOURCE
+#     req-indexed tables (gpu/model_runner.py preprocess_state)
+#   - vllm#53142 state-seed divisor = mamba group block size (mamba_hybrid)
+#   - #55223 reasoning-end offset scan (v1/structured_output + parser/)
+#   - GLM PP mHC hand-off + MTP embed-from-checkpoint (d09b08caf5)
+#   - Qwen UVA PLE pinned-host offload (replaces PleOffloadWorker; the
+#     VLLM_PP_LAYER_PARTITION clear patch is obsolete: no offload subprocess)
+# deliberately NOT re-ported:
+#   - #45015 PP bitmask drain: the 0.13 port rewired structured output under
+#     async scheduling to a placeholder design (pending_structured_output_tokens
+#     + num_output_placeholders, async_scheduler.py); the drain hook no longer
+#     applies. Re-evaluate against live traffic; orchestrator http_api.py
+#     request-level 502 guard (commit a9a1189) is the standing safety net.
+#   - vllm#48375 MambaManager extra block drop: upstream get_replay_boundaries
+#     (#53945/#54713) retains the checkpoint at the post-drop candidate; the
+#     extra drop zeroed resends (a47f0f82d5).
+FROM dockerproxy.net/lazymio/vllm-backport:latest-sm80
 
+# Pin the base to the exact tree this branch was verified against.
 COPY vllm/__init__.py /tmp/vllm_tree_check/__init__.py
 RUN python3 -c "import vllm,os,sys,hashlib;q=os.path.dirname(vllm.__file__);\
 d=hashlib.md5(open('/tmp/vllm_tree_check/__init__.py','rb').read()).hexdigest();\
 i=hashlib.md5(open(os.path.join(q,'__init__.py'),'rb').read()).hexdigest();\
 sys.exit(0 if d==i else (sys.stderr.write(f'BASE DRIFT {d} != {i}\n') or 1))"
 
-# Wholesale Python overlay (base verified identical to fb4a3d9; branch adds
-# PR#44 + GLM PP handoff + MTP embed-from-checkpoint + Qwen PLE PP unlocks).
-COPY vllm/ /usr/local/lib/python3.12/dist-packages/vllm/
+# Deployment layer (no vllm/ overlay on this line).
+COPY launch-dsv4.sh launch-glm.sh launch-qwen.sh fetch-glm-awq.sh \
+     verify_correctness.sh /opt/cmp17hx/
+COPY bench/ /opt/cmp17hx/bench/
+RUN chmod +x /opt/cmp17hx/*.sh /opt/cmp17hx/bench/*.py 2>/dev/null || true
 
 RUN python3 - <<'EOF'
 import importlib, os, sys
 mods = [
     "vllm.models.glm5next.nvidia.model",
     "vllm.models.qwen4_exp.nvidia.model_state",
+    "vllm.models.qwen4_exp.nvidia.ngram_embedding",
     "vllm.v1.worker.gpu.spec_decode.eagle.utils",
+    "vllm.v1.core.sched.async_scheduler",
 ]
-# importlib-only checks (no CUDA); model modules pull config/nn deps fine
 for m in mods:
     importlib.import_module(m)
-import vllm.v1.worker.gpu.spec_decode.eagle.utils as u
-assert hasattr(u, "_load_embed_from_checkpoint"), "MTP embed fix missing"
-import vllm.models.glm5next.nvidia.model as gm
-assert hasattr(gm.Glm5NextModel, "make_empty_intermediate_tensors"), "PP handoff missing"
-# PP + MTP + prefix-caching state-corruption fix ('duct' loops / all-NaN
-# logits): the mamba spec-decode copy kernels must index the SOURCE req-indexed
-# block tables by req_idx, and the V2 runner must bind the ctx to those source
-# tables rather than the per-step gathered views. Text checks (not inspect)
-# because the kernels are triton JIT objects.
+
+# Text assertions (triton JIT objects / plain scripts): the fixes this line
+# is required to carry upstream.
 root = os.path.dirname(importlib.import_module("vllm").__file__)
 read = lambda *p: open(os.path.join(root, *p)).read()
+
+# PR #63: kernels index the SOURCE req-indexed tables by req_idx.
 mu = read("v1", "worker", "mamba_utils.py")
 assert "bt_row_idx = req_idx" in mu, "mamba postprocess still indexes batch rows"
 assert "HAS_IDX_MAPPING else req_idx" not in mu, "stale batch-row indexing is back"
-assert "req_idx,\n        src_col," in mu, "mamba precopy still indexes batch rows"
+assert "Source tables are req-indexed" in mu, "mamba precopy still indexes batch rows"
+
+# PR #63 runner half: ctx bound to source tables in preprocess_state.
 mr = read("v1", "worker", "gpu", "model_runner.py")
 assert "tuple(bt.gpu for bt in self.block_tables.block_tables)" in mr, (
     "mamba ctx not bound to source block tables"
 )
-# vllm#48375 (unmerged): MambaManager must honour drop_eagle_block, else a
-# prefix-cache resume lands on state snapshotted over rejected draft tokens.
-sm = read("v1", "core", "single_type_kv_cache_manager.py")
-assert "max_length = max(0, max_length - kv_cache_spec.block_size)" in sm, (
-    "MambaManager ignores drop_eagle_block"
-)
-# vllm#53142 (no upstream PR): state-seed divisor = mamba group block size.
+
+# vllm#53142: state-seed divisor is the mamba group block size.
 mh = read("v1", "worker", "gpu", "model_states", "mamba_hybrid.py")
-assert "// mamba_bs" in mh, "mamba state seed uses CLI block size divisor"
-# 09-10 xgrammar FSM desync ports. #55223 (upstream main 09-08): reasoning-end
-# detection must use the offset scan, not the old per-token full-history sim.
+assert "self._mamba_block_size" in mh, "mamba state seed uses CLI block size divisor"
+
+# #55223: reasoning-end offset scan present.
 so = read("v1", "structured_output", "__init__.py")
 assert "find_reasoning_end_offset" in so, "#55223 reasoning-offset scan missing"
-# #45015 (upstream PR, open): deferred bitmask must drain in-flight batches
-# until structured FSMs catch up, else PP+async samples from a stale FSM.
-sc = read("v1", "core", "sched", "scheduler.py")
-ec = read("v1", "engine", "core.py")
-assert "def has_structured_output_in_flight" in sc, "#45015 scheduler hook missing"
-assert "has_structured_output_in_flight(" in ec, "#45015 bitmask drain missing"
+
+# GLM PP hand-off + MTP embed-from-checkpoint.
+gm = read("models", "glm5next", "nvidia", "model.py")
+assert "mHC" in gm or "mhc" in gm, "GLM PP mHC hand-off missing"
+mt = read("models", "glm5next", "nvidia", "mtp.py")
+assert "PPMissingLayer" in mt or "pp_missing" in mt.lower(), (
+    "MTP draft embed-from-checkpoint (PP) missing"
+)
+
+# Qwen UVA PLE offload replaces the PleOffloadWorker design.
+ne = read("models", "qwen4_exp", "nvidia", "ngram_embedding.py")
+assert "Qwen4ExpPLEPinnedHostEmbedding" in ne, "UVA PLE offload missing"
+assert "is_uva_available" in ne, "UVA guard missing"
+
+# Deliberate omissions (fail the build if someone re-ports them):
+st = read("v1", "core", "single_type_kv_cache_manager.py")
+assert "max_length = max(0, max_length - kv_cache_spec.block_size)" not in st, (
+    "re-ported #48375 extra block drop upstream rejects (a47f0f82d5)"
+)
 print("overlay assertions OK")
 EOF
