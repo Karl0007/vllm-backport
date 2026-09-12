@@ -425,3 +425,16 @@
 #   下一步：把该复现器缩到最小尺寸（父 ~40K / 子 ~20K 是否复现），再按上游 #53479 /
 #   #50409 / #51113 的意图移植（调度器 `_mamba_block_aligned_split` + MambaManager 的
 #   reachable_block_mask/reachable_boundaries）。
+
+# 【第三个形状：更新（2026-09-13 凌晨）】
+#   快速复现器（图模式，前置状态 = 缓存里已有更长的同文档前缀）：
+#     ① probe 248000（父，134,230 tok）② probe 96000（子，51,886 tok，是父的前缀）→ 崩
+#     cycle ≈ 6 分钟（1 次启动 + 2 个请求）。
+#   已排除：mamba 状态除数（已修为 832 ✓，eager 下取值全部合理 ✓）、密集保留
+#   （VLLM_PREFIX_CACHE_RETENTION_INTERVAL=832，仍崩 ✗）、eager 模式（干净 ✓）。
+#   地址归属（torch.cuda.memory_snapshot）：最大段 0x26e0000000..0x3019400000 = 37.8 GB
+#   （KV + mamba state），而故障地址 0x25e0240000 / 0x25e6d80000 / 0x25e0581000
+#   全部落在该段**下方** ✗ -> 仍是负偏移寻址（越界在"段前"，不是段内）。
+#   下一步（内核内可见性）：图重放时 Python 不执行，必须在内核内记录
+#   fused precopy / state copy 的列索引与指针（写 UVA/共享内存缓冲，崩溃后仍可读），
+#   或按 batch 形状/请求历史二分定位负值来源。

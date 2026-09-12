@@ -224,6 +224,23 @@ class MambaHybridModelState(DefaultModelState):
         if num_reqs == 0:
             return
         mamba_group_ids, mamba_spec = self._get_mamba_group_info(kv_cache_config)
+        import os as _os
+
+        if _os.environ.get("VLLM_MAMBA_PRECOPY_DEBUG", "0") == "1" and not getattr(
+            self, "_seg_logged", False
+        ):
+            self._seg_logged = True
+            import logging as _logging
+
+            _seg = [
+                (int(seg["address"]), int(seg["total_size"]), seg.get("segment_type", ""))
+                for seg in torch.cuda.memory_snapshot()
+            ]
+            _seg.sort(key=lambda x: -x[1])
+            for _a, _sz, _t in _seg[:12]:
+                _logging.getLogger("vllm.mamba").warning(
+                    "CUDA_SEG addr=%#x end=%#x size=%.1f MiB %s", _a, _a + _sz, _sz / 2**20, _t
+                )
         if self._pending_state_seed:
             # Seed from the resumed position with the mamba block size, before any
             # kernel reads state_idx.
