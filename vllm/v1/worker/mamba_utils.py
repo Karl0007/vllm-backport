@@ -258,9 +258,28 @@ def _copy_mamba_state_block(
     # path uses bt[src_col + token_bias] (token_bias = num_accepted - 1, up to the
     # speculative block), and the token_bias offset can step past the row end even
     # when src_col itself is in range.
-    if dst_col < 0 or dst_col >= table_width or src_col < 0 or src_col >= table_width:
-        return
-    if src_col + token_bias >= table_width:
+    if (
+        dst_col < 0
+        or dst_col >= table_width
+        or src_col < 0
+        or src_col >= table_width
+        or src_col + token_bias >= table_width
+    ):
+        # A trip is loud on purpose: skipping the copy leaves the destination state
+        # stale, so it must never be silent. device_print works under CUDA-graph
+        # replay (this kernel completes before any later kernel can fault).
+        tl.device_print(
+            "COPY_COL_OOR state_idx=",
+            state_idx,
+            " dst=",
+            dst_col,
+            " src=",
+            src_col,
+            " bias=",
+            token_bias,
+            " width=",
+            table_width,
+        )
         return
     dest_block_id = tl.load(block_table_base + dst_col).to(tl.int64)
     dst_addr = state_base_addr + dest_block_id * state_block_stride
