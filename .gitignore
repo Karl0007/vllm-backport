@@ -257,4 +257,5 @@ csrc/cpu/cpu_attn_dispatch_generated.h
 vllm_cache/
 vllm_cache_dsv4/
 vllm_cache_qwen/
+kkx99-cache/
 .dockerignore.cmp170hx

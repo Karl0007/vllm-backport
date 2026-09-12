@@ -1,11 +1,12 @@
-# Derived runtime: lazymio/vllm-backport:v0.11.2-sm80 (prebuilt sm80 wheel) +
-# the cmp170hx branch's vllm/ PYTHON tree overlaid wholesale.
+# Derived runtime: lazymio/vllm-backport:v0.13.0-sm80 (prebuilt sm80 wheel, built
+# from origin/master at tag v0.13.0) + the cmp170hx branch's vllm/ PYTHON tree
+# overlaid wholesale.
 #
-# Verified: every .py in the image matches git fb4a3d9 (md5 spot-checks on the
-# highest-churn files), and the cmp170hx changes are Python-only, so the fork's
-# compiled _C.abi3.so is kept untouched. No source build needed.
-# v0.11.2 = origin/master tag (PR#44+#47+#49 merged); branch rebased onto it.
-FROM dockerproxy.net/lazymio/vllm-backport:v0.11.2-sm80
+# Only vllm/**.py is overlaid; the compiled _C.abi3.so comes from the base, so
+# csrc/ changes carried by this branch (the fail-fast alignment traps) are NOT in
+# this image -- those need a source build. The Python tree is version-checked
+# against the base below (BASE DRIFT guard).
+FROM dockerproxy.net/lazymio/vllm-backport:v0.13.0-sm80
 
 COPY vllm/__init__.py /tmp/vllm_tree_check/__init__.py
 RUN python3 -c "import vllm,os,sys,hashlib;q=os.path.dirname(vllm.__file__);\
@@ -19,6 +20,8 @@ COPY vllm/ /usr/local/lib/python3.12/dist-packages/vllm/
 
 RUN python3 - <<'EOF'
 import importlib, os, sys
+root = os.path.dirname(importlib.import_module("vllm").__file__)
+read = lambda *p: open(os.path.join(root, *p)).read()
 mods = [
     "vllm.models.glm5next.nvidia.model",
     "vllm.models.qwen4_exp.nvidia.model_state",
@@ -36,8 +39,6 @@ assert hasattr(gm.Glm5NextModel, "make_empty_intermediate_tensors"), "PP handoff
 # block tables by req_idx, and the V2 runner must bind the ctx to those source
 # tables rather than the per-step gathered views. Text checks (not inspect)
 # because the kernels are triton JIT objects.
-root = os.path.dirname(importlib.import_module("vllm").__file__)
-read = lambda *p: open(os.path.join(root, *p)).read()
 mu = read("v1", "worker", "mamba_utils.py")
 assert "bt_row_idx = req_idx" in mu, "mamba postprocess still indexes batch rows"
 assert "HAS_IDX_MAPPING else req_idx" not in mu, "stale batch-row indexing is back"
@@ -53,8 +54,9 @@ assert "max_length = max(0, max_length - kv_cache_spec.block_size)" in sm, (
     "MambaManager ignores drop_eagle_block"
 )
 # vllm#53142 (no upstream PR): state-seed divisor = mamba group block size.
+# (v0.13.0 carries the same fix as `// self._mamba_block_size`.)
 mh = read("v1", "worker", "gpu", "model_states", "mamba_hybrid.py")
-assert "// mamba_bs" in mh, "mamba state seed uses CLI block size divisor"
+assert "// self._mamba_block_size" in mh, "mamba state seed uses CLI block size divisor"
 # 09-10 xgrammar FSM desync ports. #55223 (upstream main 09-08): reasoning-end
 # detection must use the offset scan, not the old per-token full-history sim.
 so = read("v1", "structured_output", "__init__.py")
@@ -65,5 +67,13 @@ sc = read("v1", "core", "sched", "scheduler.py")
 ec = read("v1", "engine", "core.py")
 assert "def has_structured_output_in_flight" in sc, "#45015 scheduler hook missing"
 assert "has_structured_output_in_flight(" in ec, "#45015 bitmask drain missing"
+# syv-ai's marlin set (int8 tensor-core GEMMs on Ampere): per-layer int8 activation
+# selection, negative-scale handling, staged sm80 repack, and the tune table.
+assert "VLLM_MARLIN_INT8_INCLUDE_RE" in read("envs.py"), "marlin int8 layer select missing"
+_mk = read("model_executor", "kernels", "linear", "mixed_precision", "marlin.py")
+assert "_use_staged_repack" in _mk, "staged sm80 repack missing"
+assert "_load_marlin_tune" in _mk, "marlin tune table missing"
+_mu = read("model_executor", "layers", "quantization", "utils", "marlin_utils.py")
+assert "VLLM_MARLIN_INT8_EXCLUDE_RE" in _mu, "marlin int8 include/exclude missing"
 print("overlay assertions OK")
 EOF

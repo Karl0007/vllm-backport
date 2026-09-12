@@ -36,3 +36,7 @@ share/python-wheels/
 *.egg
 MANIFEST
 rust/target/
+
+# Host launcher caches (created by launch-*.sh in this directory)
+kkx99-cache/
+vllm_cache*/
