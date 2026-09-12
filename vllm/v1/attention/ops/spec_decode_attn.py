@@ -38,7 +38,7 @@ QMAX_TOKENS = 64   # query tokens per request the caller may ask for
 
 @triton.jit
 def _spec_attn_partial(
-    q_ptr, k_ptr, v_ptr, bt_ptr, seqused_ptr, cu_q_ptr, total_tokens,
+    q_ptr, k_ptr, v_ptr, bt_ptr, seqused_ptr, cu_q_ptr, total_tokens, nblocks, diag_ptr,
     part_o_ptr, part_m_ptr, part_l_ptr,
     scale,
     stride_qt, stride_qh,
@@ -75,7 +75,18 @@ def _spec_attn_partial(
     row_ok = (r < QT * G) & (ri < q_len)
     q_pos = kv_len - q_len + ri                      # kv position of each query row
     d = tl.arange(0, D)
-    q_ptrs = q_ptr + (q_start + ri)[:, None] * stride_qt + (kvh * G + rg)[:, None] * stride_qh + d[None, :]
+    # Bound every address by construction: a captured CUDA graph replays these kernels
+    # with arguments fixed at capture time, so a single stale value must not be able to
+    # turn into a wild address (2026-09-12: an Xid 31 read ~4.2 GB below the KV cache).
+    q_start_c = tl.minimum(tl.maximum(q_start, 0), tl.maximum(total_tokens - 1, 0))
+    if q_start != q_start_c:
+        tl.store(diag_ptr + 8, 1)
+        tl.store(diag_ptr + 9, q_start)
+        tl.store(diag_ptr + 10, q_len)
+        tl.store(diag_ptr + 11, total_tokens)
+        tl.store(diag_ptr + 12, kv_len)
+    q_row = tl.minimum(q_start_c + ri, tl.maximum(total_tokens - 1, 0))
+    q_ptrs = q_ptr + q_row[:, None] * stride_qt + (kvh * G + rg)[:, None] * stride_qh + d[None, :]
     q = tl.load(q_ptrs, mask=row_ok[:, None], other=0.0)
 
     # this segment's key range
@@ -93,6 +104,23 @@ def _spec_attn_partial(
         pos = t * TILE + tl.arange(0, TILE)
         k_ok = pos < kv_len
         blk = tl.load(bt_ptr + req * stride_bt + pos // BLOCK_SIZE, mask=k_ok, other=0)
+        # A block id outside the cache is never valid; treat those positions as absent
+        # rather than letting the address run away. Under CUDA-graph replay the caller
+        # cannot validate the table (no Python runs), so this is the only backstop:
+        # 2026-09-12 a garbage id put the read ~4.2 GB below the cache base and faulted
+        # the GPU (Xid 31) on prefix-cache-hit steps.
+        bad = (blk < 0) | (blk >= nblocks)
+        if tl.max(bad.to(tl.int32)) != 0:
+            first = tl.min(tl.where(bad, pos, 1 << 30))
+            tl.store(diag_ptr + 0, 1)
+            tl.store(diag_ptr + 1, req)
+            tl.store(diag_ptr + 2, kvh)
+            tl.store(diag_ptr + 3, seg)
+            tl.store(diag_ptr + 4, t)
+            tl.store(diag_ptr + 5, first)
+            tl.store(diag_ptr + 6, tl.min(tl.where(bad, blk, 1 << 30)))
+            tl.store(diag_ptr + 7, nblocks)
+        k_ok = k_ok & ~bad
         slot = pos % BLOCK_SIZE
         k_ptrs = k_ptr + blk[:, None] * stride_kb + slot[:, None] * stride_ks + kvh * stride_kh + d[None, :]
         v_ptrs = v_ptr + blk[:, None] * stride_vb + slot[:, None] * stride_vs + kvh * stride_vh + d[None, :]
@@ -122,7 +150,10 @@ def _spec_attn_combine(
     part_o_ptr, part_m_ptr, part_l_ptr, out_ptr, cu_q_ptr, seqused_ptr, total_tokens,
     stride_ot, stride_oh,
     Hq: tl.constexpr, QMAX: tl.constexpr, D: tl.constexpr, NSEG: tl.constexpr,
+    NOOP: tl.constexpr,
 ):
+    if NOOP:
+        return
     req = tl.program_id(0)
     h = tl.program_id(1)
     i = tl.program_id(2)
@@ -148,7 +179,8 @@ def _spec_attn_combine(
         d = tl.arange(0, D)
         o = tl.load(part_o_ptr + (base + segs)[:, None] * D + d[None, :])   # [NSEG, D]
         o = tl.sum(o * w[:, None], 0) / tl.maximum(l_tot, 1e-30)
-        tl.store(out_ptr + (q_start + i) * stride_ot + h * stride_oh + d, o.to(out_ptr.dtype.element_ty))
+        row = tl.minimum(tl.maximum(q_start + i, 0), tl.maximum(total_tokens - 1, 0))
+        tl.store(out_ptr + row * stride_ot + h * stride_oh + d, o.to(out_ptr.dtype.element_ty))
 
 
 class SpecDecodeAttention:
@@ -165,6 +197,7 @@ class SpecDecodeAttention:
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.device = device
+        self.diag = torch.zeros(16, dtype=torch.int32, device=device)
         n = max_num_reqs * num_heads * qmax * self.nseg
         self.part_o = torch.empty(n, head_dim, dtype=torch.float32, device=device)
         self.part_m = torch.empty(n, dtype=torch.float32, device=device)
@@ -205,7 +238,7 @@ class SpecDecodeAttention:
         grid = (num_reqs * ntile, Hkv, self.nseg)
         _spec_attn_partial[grid](
             q, key_cache, value_cache, block_table, seqused_k, cu_seqlens_q,
-            q.shape[0],
+            q.shape[0], key_cache.shape[0], self.diag,
             self.part_o, self.part_m, self.part_l,
             scale,
             q.stride(0), q.stride(1),
@@ -220,6 +253,8 @@ class SpecDecodeAttention:
             self.part_o, self.part_m, self.part_l, out, cu_seqlens_q, seqused_k,
             q.shape[0],
             out.stride(0), out.stride(1),
-            Hq=Hq, QMAX=self.qmax, D=D, NSEG=self.nseg, num_warps=4,
+            Hq=Hq, QMAX=self.qmax, D=D, NSEG=self.nseg,
+            NOOP=os.environ.get("VLLM_SPEC_ATTN_NOOP_COMBINE", "0") == "1",
+            num_warps=4,
         )
         return out

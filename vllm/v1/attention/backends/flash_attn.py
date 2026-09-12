@@ -1940,14 +1940,6 @@ def _spec_attn_run(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k
         reason = _spec_attn_validate(impl, q, key_cache, block_table, cu_seqlens_q,
                                      seqused_k, num_reqs, max_query_len,
                                      out.stride(0), out.stride(1))
-        logger.info(
-            "SPEC_ATTN step: num_reqs=%d max_q=%d qrows=%d cu=%s seqused=%s "
-            "table=%s kvshape=%s audit=%r",
-            num_reqs, max_query_len, q.shape[0],
-            cu_seqlens_q[: num_reqs + 1].tolist(),
-            seqused_k[:num_reqs].tolist(),
-            tuple(block_table.shape), tuple(key_cache.shape), reason or "clean",
-        )
         if reason:
             logger.error(
                 "split-KV spec-decode attention: falling back to FA2 — %s "
@@ -1970,6 +1962,41 @@ def _spec_attn_run(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k
             _spec_attn_qmax(impl),
         )
         _SPEC_ATTN[key] = att
+        # One-shot buffer map: an MMU fault (Xid 31) leaves no other trace, so the
+        # addresses let a post-mortem place the faulting address in (or outside) these
+        # allocations. Addresses are stable for the engine's life (allocated once, and
+        # a captured CUDA graph holds them).
+        if True:
+            logger.info(
+                "SPEC_ATTN buffers: q=%#x n=%d | k=%#x n=%d | v=%#x n=%d | bt=%#x n=%d "
+                "| cu=%#x n=%d | seqused=%#x n=%d | part_o=%#x n=%d | part_m=%#x n=%d "
+                "| part_l=%#x n=%d",
+                q.data_ptr(), q.numel(), key_cache.data_ptr(), key_cache.numel(),
+                value_cache.data_ptr(), value_cache.numel(),
+                block_table.data_ptr(), block_table.numel(),
+                cu_seqlens_q.data_ptr(), cu_seqlens_q.numel(),
+                seqused_k.data_ptr(), seqused_k.numel(),
+                att.part_o.data_ptr(), att.part_o.numel(),
+                att.part_m.data_ptr(), att.part_m.numel(),
+                att.part_l.data_ptr(), att.part_l.numel(),
+            )
+    if _spec_attn_debug() and not torch.cuda.is_current_stream_capturing():
+        diag = att.diag.tolist()
+        if diag[0] or diag[8]:
+            logger.error(
+                "SPEC_ATTN kernel guard: bad_blk=%d req=%d kvh=%d seg=%d t=%d first_pos=%d "
+                "min_blk=%d nblocks=%d | clamped_row=%d raw_q_start=%d q_len=%d "
+                "total_tokens=%d kv_len=%d",
+                *diag,
+            )
+        logger.info(
+            "SPEC_ATTN step: num_reqs=%d max_q=%d qrows=%d cu=%s seqused=%s "
+            "table=%s kvshape=%s audit=%r",
+            num_reqs, max_query_len, q.shape[0],
+            cu_seqlens_q[: num_reqs + 1].tolist(),
+            seqused_k[:num_reqs].tolist(),
+            tuple(block_table.shape), tuple(key_cache.shape), reason or "clean",
+        )
         logger.info(
             "split-KV spec-decode attention active: heads=%d head_dim=%d qmax=%d "
             "segments=%d max_num_reqs=%d",
@@ -1979,6 +2006,11 @@ def _spec_attn_run(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k
             att.nseg,
             att.max_num_reqs,
         )
+    if _spec_attn_shadow():
+        # Control mode: allocate exactly what the kernel needs (so the memory layout
+        # matches a kernel-enabled run) but compute with FA2. Isolates "our kernel's
+        # execution" from "our kernel's allocations shifted someone else's OOB".
+        return False
     att.run(
         q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table,
         impl.scale, num_reqs, max_query_len,
@@ -1991,6 +2023,12 @@ def _spec_attn_run(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k
 # a prefix-cache hit faulted the kernel with a virtual read (Xid 31) on 2026-09-12 and
 # the engine dies before anything can be inspected. A non-empty return means the batch
 # must go to FA2.
+def _spec_attn_shadow() -> bool:
+    import os
+
+    return os.environ.get("VLLM_SPEC_ATTN_SHADOW", "0") == "1"
+
+
 def _spec_attn_debug() -> bool:
     import os
 
