@@ -110,9 +110,22 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
             self._mamba_group_ids: list[int] = []
             self._mamba_spec: MambaSpec | None = None
-            self._mamba_block_size = (
-                self.cache_config.mamba_block_size or self.cache_config.block_size
-            )
+            # The align invariant (platforms/interface.py) is
+            # mamba_block_size == cache_config.block_size, and only a user-specified
+            # mamba block size overrides it ("mamba_block_size here should either be
+            # user specified value or None"). The value this worker receives can
+            # predate that hook -- 16, the default --block-size -- and the state
+            # divisor is then ~52x too small, so a prefix-cache resume seeds
+            # state_idx far past the state table and the fused align pre-copy reads
+            # a garbage address (Xid 31; the vllm#53142 class). Mirror the hook.
+            # Only a user-specified value is authoritative here; everything else is
+            # resolved from the mamba group's spec in _get_mamba_group_info. At this
+            # point cache_config.block_size is still the CLI default (16) -- the
+            # platform hook bumps it to the attention block size later -- so latching
+            # it would seed state_idx ~52x out of range and the fused align pre-copy
+            # would read a garbage column (Xid 31; the vllm#53142 class).
+            self._mamba_block_size = self.cache_config.mamba_block_size
+            self._pending_state_seed: dict[int, int] = {}
             self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
@@ -126,9 +139,9 @@ class MambaHybridModelState(DefaultModelState):
             # cached prefix would otherwise seed an out-of-range block_table
             # column that the fused align pre-copy reads as a garbage block id
             # (vllm#53142).
-            self._mamba_state_idx_gpu[req_index].fill_(
-                (new_req_data.num_computed_tokens - 1) // self._mamba_block_size
-            )
+            # Deferred: the divisor is the mamba group's block size, known only once
+            # the kv cache config is in hand (preprocess_state).
+            self._pending_state_seed[req_index] = new_req_data.num_computed_tokens
 
     def _get_mamba_group_info(
         self, kv_cache_config: KVCacheConfig
@@ -143,6 +156,10 @@ class MambaHybridModelState(DefaultModelState):
                 for spec in mamba_groups
             ), "all mamba groups must share cache scheduling parameters"
             self._mamba_group_ids = get_mamba_group_ids(mamba_groups)
+            # The state table is dimensioned by the mamba group's block size: this is
+            # the divisor every state column must be derived from.
+            if not self.cache_config.user_specified_mamba_block_size:
+                self._mamba_block_size = mamba_spec.block_size
             self._mamba_spec = mamba_spec
         return self._mamba_group_ids, self._mamba_spec
 
@@ -207,6 +224,14 @@ class MambaHybridModelState(DefaultModelState):
         if num_reqs == 0:
             return
         mamba_group_ids, mamba_spec = self._get_mamba_group_info(kv_cache_config)
+        if self._pending_state_seed:
+            # Seed from the resumed position with the mamba block size, before any
+            # kernel reads state_idx.
+            for idx, num_computed in self._pending_state_seed.items():
+                self._mamba_state_idx_gpu[idx].fill_(
+                    max(0, (num_computed - 1) // self._mamba_block_size)
+                )
+            self._pending_state_seed.clear()
         ctx = self._ensure_align_ctx(kv_cache_config, mamba_group_ids, block_tables)
 
         # The state-advance + pre-copy kernels run every step; they fast-exit per
@@ -229,6 +254,25 @@ class MambaHybridModelState(DefaultModelState):
             BLOCK_SIZE=block,
             MAMBA_BLOCK_SIZE=mamba_spec.block_size,
         )
+        import os as _os
+
+        if _os.environ.get("VLLM_MAMBA_PRECOPY_DEBUG", "0") == "1":
+            import logging as _logging
+
+            _logging.getLogger("vllm.mamba").warning(
+                "PRECOPY num_reqs=%d state_idx=%s src_col=%s src_off=%s "
+                "mamba_block_size=%r user_specified=%r mamba_mode=%r spec_block_size=%d "
+                "cache_block_size=%d",
+                num_reqs,
+                self._mamba_state_idx_gpu[:num_reqs].tolist(),
+                self._mamba_src_col_gpu[:num_reqs].tolist(),
+                self._mamba_src_off_gpu[:num_reqs].tolist(),
+                self._mamba_block_size,
+                self.cache_config.user_specified_mamba_block_size,
+                self.cache_config.mamba_cache_mode,
+                mamba_spec.block_size,
+                self.cache_config.block_size,
+            )
         ctx.run_fused_precopy(
             num_reqs,
             self._mamba_state_idx_gpu,

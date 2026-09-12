@@ -386,3 +386,30 @@
 #   可选但未采纳：SPEC_ATTN=1 + --no-enable-prefix-caching（62-70 tok/s @134K），
 #   代价是重复长前缀每次全量 prefill（对 agent 场景不划算）。
 # ─────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────
+# 2026-09-12(深夜三) 两个崩溃根因定位并修复（均已在各自复现器上验证）
+#
+# 【根因 1 = vllm#48375 的额外丢弃】另一条线（karl/cmp170hx-v013）在合并时明确说过
+#   它在本基座上会把重发状态清零。删除后："8 并发 harness + 同一 64.7K prompt 连发 4 次
+#   （第 2-4 次命中前缀缓存，TTFT 1.34 s）"从崩变为全过（169 tok/s / 62-70 tok/s @134k）。
+#
+# 【根因 2 = mamba 状态列除数错误（vllm#53142 类）】CUDA_LAUNCH_BLOCKING 下栈指向
+#   model_states/mamba_hybrid.py:232 preprocess_state -> mamba_utils.py:1226
+#   run_fused_precopy（precopy_mamba_align_fused_kernel）。
+#   实测取值：mamba_block_size=16（应 832）user_specified=False spec_block_size=832
+#   cache_block_size=832。即 worker 用了 cache_config.mamba_block_size（16 = CLI 默认块大小，
+#   早于 platforms/interface.py 把 cache_config.block_size 提升到 832 的那一步），
+#   于是前缀续跑时 state_idx=(num_computed-1)//16 比状态表列数大 ~52 倍 -> 越界读。
+#   上游分析同源（#53142/#54199："seeds an out-of-range block_table column ... garbage
+#   block id"），但方向相反：他们是 cache_config.block_size 被覆盖，我们是 mamba_block_size
+#   陈旧。修复：不再在 worker init 锁存该值；在 add_request 记录待播种位置，等
+#   _get_mamba_group_info 拿到 mamba 组 spec 后，用 mamba_spec.block_size 播种
+#   （只有用户显式指定时才用 cache_config 的值，与平台钩子的规则一致）。
+#   验证："64.7K -> 135K x4（第 2 次起全部命中前缀缓存）"全过，健康 200。
+#
+# 【尚未闭环】组合序列（8 并发 harness -> 96K 长请求）在图模式下仍观察到一次异步
+#   illegal access，而那一步的 mamba 取值全部正常（state_idx/src_col/除数 832 均合理）。
+#   eager+blocking 下同序列未复现。下一步：对该组合序列用图内手段（UVA/共享内存诊断）
+#   或按 batch 形状二分，定位是否为第三个独立缺陷。生产已带两个修复运行。
+# ─────────────────────────────────────────────────────────────────────────
