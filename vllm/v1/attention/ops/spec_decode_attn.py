@@ -38,7 +38,7 @@ QMAX_TOKENS = 64   # query tokens per request the caller may ask for
 
 @triton.jit
 def _spec_attn_partial(
-    q_ptr, k_ptr, v_ptr, bt_ptr, seqused_ptr, cu_q_ptr,
+    q_ptr, k_ptr, v_ptr, bt_ptr, seqused_ptr, cu_q_ptr, total_tokens,
     part_o_ptr, part_m_ptr, part_l_ptr,
     scale,
     stride_qt, stride_qh,
@@ -61,10 +61,11 @@ def _spec_attn_partial(
 
     # cu_seqlens_q is a padded persistent buffer: only [:num_reqs + 1] is written each
     # step, so the tail keeps the previous (larger) batch's prefix sums. seqused_k pads
-    # are zero and stay zero, so a request with no KV cannot be a real one. Without this
-    # the stale tail's q_start/q_len index query rows and output rows that belong to
-    # real requests (observed: illegal address on the step after an 8-request batch).
-    if kv_len <= 0:
+    # are zero and stay zero, so a request with no KV cannot be a real one, and a slot
+    # whose query rows fall outside this step's token count cannot be one either. A slot
+    # failing either test is inert (the combine kernel applies the same test, so it never
+    # reads a partial that was not written).
+    if kv_len <= 0 or q_start < 0 or q_start + q_len > total_tokens:
         return
 
     # rows: r = i * G + g  -> query token qtile * QT + i (0..q_len-1), head kvh*G + g
@@ -118,7 +119,7 @@ def _spec_attn_partial(
 
 @triton.jit
 def _spec_attn_combine(
-    part_o_ptr, part_m_ptr, part_l_ptr, out_ptr, cu_q_ptr, seqused_ptr,
+    part_o_ptr, part_m_ptr, part_l_ptr, out_ptr, cu_q_ptr, seqused_ptr, total_tokens,
     stride_ot, stride_oh,
     Hq: tl.constexpr, QMAX: tl.constexpr, D: tl.constexpr, NSEG: tl.constexpr,
 ):
@@ -127,9 +128,15 @@ def _spec_attn_combine(
     i = tl.program_id(2)
     q_start = tl.load(cu_q_ptr + req)
     q_len = tl.load(cu_q_ptr + req + 1) - q_start
-    # Same padded-buffer guard as the partial kernel: skip requests with no KV, whose
-    # stale q_start/q_len would otherwise write past this step's output rows.
-    if i < q_len and tl.load(seqused_ptr + req) > 0:
+    # Same padded-buffer guard as the partial kernel, so the two agree on which slots
+    # have partials: skip slots with no KV, and slots whose query rows fall outside this
+    # step's token count (a stale cu_seqlens_q tail would otherwise write past them).
+    if (
+        i < q_len
+        and tl.load(seqused_ptr + req) > 0
+        and q_start >= 0
+        and q_start + q_len <= total_tokens
+    ):
         base = ((req * Hq + h) * QMAX + i) * NSEG
         segs = tl.arange(0, NSEG)
         m = tl.load(part_m_ptr + base + segs)
@@ -198,6 +205,7 @@ class SpecDecodeAttention:
         grid = (num_reqs * ntile, Hkv, self.nseg)
         _spec_attn_partial[grid](
             q, key_cache, value_cache, block_table, seqused_k, cu_seqlens_q,
+            q.shape[0],
             self.part_o, self.part_m, self.part_l,
             scale,
             q.stride(0), q.stride(1),
@@ -210,6 +218,7 @@ class SpecDecodeAttention:
         )
         _spec_attn_combine[(num_reqs, Hq, max_query_len)](
             self.part_o, self.part_m, self.part_l, out, cu_seqlens_q, seqused_k,
+            q.shape[0],
             out.stride(0), out.stride(1),
             Hq=Hq, QMAX=self.qmax, D=D, NSEG=self.nseg, num_warps=4,
         )

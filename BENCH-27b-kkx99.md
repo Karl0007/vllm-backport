@@ -318,3 +318,37 @@
 #   只做其一：改内核 -> ~70 tok/s（35% 衰减）；只压 KV -> 行受限，白压。
 #   结论：<20% 在这个模型+草稿+这张卡上不可达；当前 1.81x（45%）已与参考栈持平。
 # ─────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────
+# 2026-09-12(深夜) 事故复盘：split-KV 内核在长上下文上触发 GPU MMU Fault（生产已回退）
+#
+# 【症状】Xid 31 `MMU Fault ... FAULT_PDE ACCESS_TYPE_VIRT_READ`，进程 VLLM::EngineCore；
+#   `CUDA_LAUNCH_BLOCKING=1` 下栈指向：flash_attn.py:1196 forward -> _spec_attn_run:1966
+#   -> spec_decode_attn.py:199（partial 内核）。
+#
+# 【复现】CUDA graph（默认模式）+ 同一 ~135k token prompt 连发两次：
+#   第一次正常，第二次（整段命中前缀缓存，num_common_prefix_blocks=163）崩。
+#   多轮实测：32.7k/65.5k 连发正常；~98k 曾在特定会话崩过（非确定）；eager+守卫下不崩。
+#   A/B：同场景 SPEC_ATTN=0（内核关）两次都正常 -> 责任在这个内核。
+#
+# 【已排除】
+#   - 块号越界：审计显示的“offset >= numel”是视图 numel 与底层存储之差（KV 为 K/V 交错
+#     布局，stride(0)=1703936=832x4x512，实际地址落在底层存储内）-> 假阳性。
+#   - 幽灵槽位：vLLM 在 gpu_model_runner.py:2203 有 `self.seq_lens[num_reqs:].fill_(0)`，
+#     补位 seq_len 恒为 0；且内核用 `kv_len<=0 -> return`（partial）与同条件（combine）判惰性。
+#   - partial 缓冲尺寸：按 (max_num_seqs x heads x qmax x NSEG) 分配并逐项校验过。
+#
+# 【本轮已落地的加固（保留）】
+#   1) FlashAttentionMetadata 新增真实 num_reqs（由 build() 从 common_attn_metadata 填入），
+#      不再用 query_start_loc.shape[0]-1 这种“补齐上界”。
+#   2) 内核新增槽位一致性守卫：`kv_len<=0 or q_start<0 or q_start+q_len>total_tokens`
+#      一律惰性（partial 与 combine 用同一条件，保证不会读到没写的 partial）。
+#   3) 调试探针（VLLM_SPEC_ATTN_DEBUG=1，捕获期自动跳过）：逐步记录 num_reqs/cu/seqused/
+#      table 形状 + 地址审计，校验失败则回退 FA2。
+#   效果：eager 下同序列已不再崩；但【图模式仍崩】——重放时 Python 不执行，Python 侧
+#   守卫与日志都无效，必须靠内核内部手段（把越界索引写进设备缓冲，再在下一个 eager 步
+#   或信号处理里取回），或 cuda-gdb 附加。
+#
+# 【当前状态】生产回退为 SPEC_ATTN=0（122k: 45.96 ms -> 21.8 tok/s，即内核前基线）。
+#   内核代码、调参与守卫都留在树里（SPEC_ATTN=1 可再启用），但根因未定位前不上生产。
+# ─────────────────────────────────────────────────────────────────────────
