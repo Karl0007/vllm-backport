@@ -1,19 +1,29 @@
 # Derived runtime: lazymio/vllm-backport:latest-sm80 (v0.13.0, upstream
 # 93911fcf68 port line, LMCache fork bundled) + the cmp170hx-v013 deployment
-# layer. The vllm/ PYTHON tree on this branch is upstream-identical, so the
-# overlay only carries deployment files (launchers, bench); the base image is
-# used AS IS. Assertions pin the fixes this line must contain (verified at
-# port time, 2026-09-11, origin/master a350766628):
+# layer. The branch now carries local Python patches, so the overlay copies
+# those files over the base tree (see "patched locally" below); everything
+# else is used AS IS. Assertions pin the fixes this line must contain
+# (verified at port time, 2026-09-11, origin/master a350766628):
 #
 # carried upstream (no local patch needed):
 #   - PR #63 PP+MTP+prefix-cache mamba state corruption: align copy kernels
 #     index rows by req_idx (mamba_utils.py) + runner binds ctx to the SOURCE
 #     req-indexed tables (gpu/model_runner.py preprocess_state)
-#   - vllm#53142 state-seed divisor = mamba group block size (mamba_hybrid)
 #   - #55223 reasoning-end offset scan (v1/structured_output + parser/)
 #   - GLM PP mHC hand-off + MTP embed-from-checkpoint (d09b08caf5)
 #   - Qwen UVA PLE pinned-host offload (replaces PleOffloadWorker; the
 #     VLLM_PP_LAYER_PARTITION clear patch is obsolete: no offload subprocess)
+# patched locally (overlay below):
+#   - mamba_hybrid.py align-mode state column divisor. The port checklist
+#     assumed upstream carried the vllm#53142 seed fix because the file cites
+#     that issue; it does not. Upstream divides by
+#     `cache_config.mamba_block_size or cache_config.block_size`, which on a
+#     hybrid engine is smaller than the mamba group's aligned page (16 vs 4480
+#     here), so a prefix-cache resume seeded a column up to 280x too large --
+#     outside the block-table row -- and the align pre-copy read a garbage
+#     block id (Xid 13). The v0.11.2 line fixed this in 1cdd6bc316.
+#   - flash_linear_attention/ops/index.py: derive per-step chunk metadata on
+#     every call instead of caching it by tensor identity.
 # deliberately NOT re-ported:
 #   - #45015 PP bitmask drain: the 0.13 port rewired structured output under
 #     async scheduling to a placeholder design (pending_structured_output_tokens
@@ -32,7 +42,30 @@ d=hashlib.md5(open('/tmp/vllm_tree_check/__init__.py','rb').read()).hexdigest();
 i=hashlib.md5(open(os.path.join(q,'__init__.py'),'rb').read()).hexdigest();\
 sys.exit(0 if d==i else (sys.stderr.write(f'BASE DRIFT {d} != {i}\n') or 1))"
 
-# Deployment layer (no vllm/ overlay on this line).
+# Local vllm/ patches (this line is no longer upstream-identical).
+COPY vllm/v1/worker/gpu/model_states/mamba_hybrid.py /tmp/vllm_patch/mamba_hybrid.py
+COPY vllm/third_party/flash_linear_attention/ops/index.py /tmp/vllm_patch/fla_index.py
+RUN python3 - <<'EOF'
+import importlib, os, shutil
+root = os.path.dirname(importlib.import_module("vllm").__file__)
+targets = {
+    "/tmp/vllm_patch/mamba_hybrid.py": "v1/worker/gpu/model_states/mamba_hybrid.py",
+    "/tmp/vllm_patch/fla_index.py": "third_party/flash_linear_attention/ops/index.py",
+}
+for src, rel in targets.items():
+    shutil.copy2(src, os.path.join(root, rel))
+
+mh = open(os.path.join(root, "v1/worker/gpu/model_states/mamba_hybrid.py")).read()
+assert "self._mamba_block_size = int(mamba_spec.block_size)" in mh, (
+    "align state column divisor must come from the resolved mamba spec"
+)
+assert "_pending_state_seed" in mh, "deferred resume seeding missing"
+idx = open(os.path.join(root, "third_party/flash_linear_attention/ops/index.py")).read()
+assert "tensor_cache" not in idx, "per-step chunk metadata is cached by identity again"
+print("local vllm/ patches applied")
+EOF
+
+# Deployment layer.
 COPY launch-dsv4.sh launch-glm.sh launch-qwen.sh fetch-glm-awq.sh \
      verify_correctness.sh /opt/cmp17hx/
 COPY bench/ /opt/cmp17hx/bench/
