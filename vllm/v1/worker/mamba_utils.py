@@ -263,13 +263,6 @@ def _copy_mamba_state_block(
     if src_col + token_bias >= table_width:
         return
     dest_block_id = tl.load(block_table_base + dst_col).to(tl.int64)
-    # Loud on purpose and unconditional: this runs only when a copy actually happens
-    # (src_col >= 0 and src_col != dst_col), so the volume is bounded, and it is the
-    # last uninstrumented hop before the state bytes are addressed.
-    tl.device_print(
-        "COPY_K state_idx=", state_idx, " src_col=", src_col, " dst_col=", dst_col,
-        " bias=", token_bias, " width=", table_width, " dst_blk=", dest_block_id,
-    )
     dst_addr = state_base_addr + dest_block_id * state_block_stride
 
     is_conv_state = conv_width > 0
@@ -281,7 +274,6 @@ def _copy_mamba_state_block(
             return
         # DS conv layout: state_len is the slide axis; copy per dim row.
         src_block_id = tl.load(block_table_base + src_col).to(tl.int64)
-        tl.device_print("COPY_K src_blk=", src_block_id, " bt_row=", bt_row_idx)
         dim_rows = tl.load(state_dim_row_count_ptr + state_idx)
         row_stride = tl.load(state_dim_row_stride_ptr + state_idx)
         src_block_addr = state_base_addr + src_block_id * state_block_stride
@@ -572,17 +564,6 @@ def preprocess_mamba_align_fused_kernel(
     tl.store(src_off_ptr + req_indices, src_off, mask=mask)
 
     num_computed = tl.load(num_computed_tokens_ptr + req_indices, mask=mask, other=0)
-    if DEBUG:
-        # Scalar summary of the first ACTIVE lane only: no per-lane flood, no host
-        # sync, and this kernel completes before the copy kernels, so the values
-        # survive a later fault inside the same CUDA-graph replay.
-        _first = tl.min(tl.where(mask, offsets, 1 << 30))
-        _sel = offsets == _first
-        tl.device_print("PRE_K n_active=", tl.sum(mask.to(tl.int32)))
-        tl.device_print("PRE_K pre_state_idx=", tl.sum(tl.where(_sel, state_idx, 0)))
-        tl.device_print("PRE_K num_computed=", tl.sum(tl.where(_sel, num_computed, 0)))
-        tl.device_print("PRE_K num_accepted=", tl.sum(tl.where(_sel, num_accepted, 0)))
-        tl.device_print("PRE_K mamba_block=", MAMBA_BLOCK_SIZE)
     if DEBUG:
         # This kernel completes before the state-copy kernels run, so its printf is
         # flushed even when a later kernel in the same graph replay faults.

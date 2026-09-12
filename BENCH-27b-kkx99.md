@@ -481,3 +481,31 @@
 #   下一步：审计"在 align 内核之外写 state 张量"的路径（mamba_attn 的状态更新、GDN 内核），
 #   以及图捕获顺序与 eager 顺序是否一致；必要时用 __graph 捕获前后各打一次 kernel 序列
 #   （torch.cuda.graph 的 debug_dump / profiler trace），比对两者顺序。
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 残留缺陷完整刻画（2026-09-13，可直接作为上游 issue 正文）
+#
+# 【标题】Hybrid GDN+Mamba 模型：spec-decode + CUDA graph + 长上下文 + 前缀缓存续跑时，
+#         mamba 状态路径触发 Xid 31（MMU Fault, VIRT_READ，地址恒在 KV/state 段下方）
+#
+# 【环境】Qwen3.8-27B AWQ-eq8emb + DFlash2-W4A16(k=7) + MS8 + async，vLLM backport
+#         v0.13.0（origin/master @09-11），CMP 170HX，mamba_cache_mode=align + 前缀缓存
+#
+# 【判定矩阵（全部实测，同一台卡同一序列：135K → 96K → 96K → 60K/轮）】
+#   CUDA graph + 投机 + 前缀续跑 + 长上下文      -> 崩（约 1 次/12-16 个长请求，偶发）
+#   --enforce-eager（同其余）                    -> 干净 ✓
+#   SPEC=none（同其余）                          -> 干净 ✓（4 轮）
+#   SPEC_ATTN=0（关我们的 split-KV 内核）        -> 照样崩 ✗（首发即崩）
+#   短/中上下文（<32K）                          -> 从不触发 ✓
+#   加任何仪表（内核 printf / 宿主同步）         -> 故障表现被挪动（12 发干净 -> 首发即崩）✗
+#
+# 【已排除（均有可判定证据，非"看着像"）】
+#   块表列越界（守卫打印从未触发）✗ / 块表被重新分配（宿主指针不变式未触发）✗ /
+#   postprocess 块大小（= mamba_spec.block_size ✓ 正确）✗ /
+#   预处理侧列与位置（内核内实测 pre_state_idx=63、num_computed=52578、除数 832 合理）✗ /
+#   我们的 split-KV 内核（内核关同崩）✗ / 除数 16->832（已修 ✓）/ #48375 额外丢弃（已修 ✓）
+#
+# 【形态结论】故障对**时序**极度敏感（观察者效应）+ 只在图重放 + 只在投机 → 指向
+#   spec-decode 的 mamba align 回存/推进路径（postprocess 的"接受后非对齐回存"、
+#   temporal state 的 bt[src_col + token_bias]）与其它写入之间的**顺序**问题，而非索引越界。
+# ═══════════════════════════════════════════════════════════════════════════
