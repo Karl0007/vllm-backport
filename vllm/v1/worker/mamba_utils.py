@@ -525,6 +525,7 @@ def preprocess_mamba_align_fused_kernel(
     num_reqs,
     BLOCK_SIZE: tl.constexpr,
     MAMBA_BLOCK_SIZE: tl.constexpr,
+    DEBUG: tl.constexpr = 0,
 ):
     """Fused align preprocess: emit the pre-copy src column/offset AND advance
     state_idx (with accepted-token reset) in a single launch (V2 align).
@@ -550,6 +551,13 @@ def preprocess_mamba_align_fused_kernel(
     tl.store(src_off_ptr + req_indices, src_off, mask=mask)
 
     num_computed = tl.load(num_computed_tokens_ptr + req_indices, mask=mask, other=0)
+    if DEBUG:
+        # This kernel completes before the state-copy kernels run, so its printf is
+        # flushed even when a later kernel in the same graph replay faults.
+        tl.device_print("PRECOPY_K pre state_idx=", state_idx)
+        tl.device_print("PRECOPY_K num_computed=", num_computed)
+        tl.device_print("PRECOPY_K accepted=", num_accepted)
+        tl.device_print("PRECOPY_K mamba_block=", MAMBA_BLOCK_SIZE)
     query_start = tl.load(query_start_loc_ptr + offsets, mask=mask, other=0)
     query_end = tl.load(query_start_loc_ptr + offsets + 1, mask=mask, other=0)
     computed_after = num_computed + query_end - query_start

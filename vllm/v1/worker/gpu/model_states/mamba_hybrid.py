@@ -251,6 +251,8 @@ class MambaHybridModelState(DefaultModelState):
             self._pending_state_seed.clear()
         ctx = self._ensure_align_ctx(kv_cache_config, mamba_group_ids, block_tables)
 
+        import os as _os
+
         # The state-advance + pre-copy kernels run every step; they fast-exit per
         # request when src_col < 0 or src_col == dst_col, so no copy happens on
         # steps that don't cross a block boundary. (Skipping the launch entirely
@@ -270,6 +272,7 @@ class MambaHybridModelState(DefaultModelState):
             num_reqs,
             BLOCK_SIZE=block,
             MAMBA_BLOCK_SIZE=mamba_spec.block_size,
+            DEBUG=_os.environ.get("VLLM_MAMBA_PRECOPY_DEBUG", "0") == "1",
         )
         import os as _os
 
