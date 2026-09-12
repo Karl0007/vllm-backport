@@ -14,7 +14,7 @@ if [ -z "$API_KEY" ]; then
   echo "ERROR: API_KEY 未设置（orchestrator profile 的 env 应该传它）——拒绝启动无鉴权 worker" >&2
   exit 1
 fi
-IMAGE="${IMAGE:-vllm/vllm-backport:cmp170hx}"
+IMAGE="${IMAGE:-vllm/vllm-backport:cmp170hx-v013}"
 TP="${TP:-1}"
 PP="${PP:-4}"
 PP_PARTITION="${PP_PARTITION:-14,11,11,9}"
