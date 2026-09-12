@@ -260,3 +260,6 @@ vllm_cache/
 vllm_cache_dsv4/
 vllm_cache_qwen/
 .dockerignore.cmp170hx
+
+# reproduction artifacts (logs/responses from the Xid repro harness)
+bench/xid-repro/runs/
