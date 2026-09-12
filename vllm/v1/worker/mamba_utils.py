@@ -249,6 +249,19 @@ def _copy_mamba_state_block(
     # Widen block ids to int64 before they reach `block_id * state_block_stride`
     # below: state_block_stride can exceed 2**31 bytes for large mamba caches,
     # and Triton would otherwise do the multiply in int32 and wrap.
+    # A block-table column outside the row is never a valid state column: reading it
+    # returns neighbouring memory as a block id, and the copy then addresses the state
+    # cache from that id (2026-09-13: Xid 31 with the fault address *below* the KV/state
+    # segment, i.e. a negative block id). Guard both columns by the row width.
+    table_width = block_table_stride_req
+    # Both source indices are guarded: the conv path uses bt[src_col], the temporal
+    # path uses bt[src_col + token_bias] (token_bias = num_accepted - 1, up to the
+    # speculative block), and the token_bias offset can step past the row end even
+    # when src_col itself is in range.
+    if dst_col < 0 or dst_col >= table_width or src_col < 0 or src_col >= table_width:
+        return
+    if src_col + token_bias >= table_width:
+        return
     dest_block_id = tl.load(block_table_base + dst_col).to(tl.int64)
     dst_addr = state_base_addr + dest_block_id * state_block_stride
 

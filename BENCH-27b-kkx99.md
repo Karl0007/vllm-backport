@@ -446,3 +446,14 @@
 #   内核内 device_print 已打通（需把 mamba_utils.py 加进挂载清单，之前漏了 ✗），
 #   但打印被掩码 lane（state_idx=-1，网格 256 行 vs 1 请求）淹没 -> 下一步必须只打印
 #   活跃 lane（mask 为真）并同时打印 copy 内核（mamba_attn/模型 copy funcs）的源列/源块。
+
+# 【2026-09-13 03:2x 第三形状：列范围守卫（两个索引）】
+#   机理：mamba 状态拷贝 `_copy_mamba_state_block` 把 `dst_col` / `src_col` 直接当块表列用，
+#   没有任何行宽校验；越界列会把相邻内存当块号 -> 负块号 -> state 基址下方的野地址
+#   （与三次故障地址全部落在 37.8GB 主段下方一致）。且时间态路径用的是
+#   `bt[src_col + token_bias]`（token_bias = num_accepted-1，可达 7），即使 src_col 在内，
+#   偏移后也可能越界 -> 两个索引都要守。
+#   验证：加入守卫后 "135K -> 96K -> 96K -> 60K" 连续 4 轮 16 发全过（此前 3 轮内必崩）；
+#   质量门（90K 文档抽数字）回答正确 '172.16'；harness 167-169 tok/s 无回归。
+#   残留：该形状仍偶发（另一轮里 r1/96K 崩过，地址回到最早的 0x25e4680000，异步无栈），
+#   需在带 CUDA_LAUNCH_BLOCKING 的图模式下继续定位（或对 postprocess 侧做同样的列守卫）。
