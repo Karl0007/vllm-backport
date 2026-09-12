@@ -189,6 +189,19 @@ def _reinterpret_u64_as_i64(value: int) -> int:
 
 
 @triton.jit
+def _probe_record(vio_ptr, check: tl.constexpr, code, value, req, capacity):
+    """Record a post-fault-visible violation record for one (check, request).
+
+    `vio_ptr` is the accelerator view of a page-locked host buffer, so the
+    record survives the device fault that follows. Slots stay at -1 (0xFFFFFFFF
+    as int32) unless a check fails, which keeps the host-side scan trivial.
+    """
+    if code != 0:
+        slot = check * capacity + req
+        tl.store(vio_ptr + slot, value)
+
+
+@triton.jit
 def _copy_mamba_state_block(
     state_idx,
     bt_row_idx,
@@ -206,10 +219,15 @@ def _copy_mamba_state_block(
     # DS conv row metadata. Zero keeps the single-region copy path.
     state_dim_row_count_ptr,
     state_dim_row_stride_ptr,
+    state_num_blocks_ptr,
+    vio_ptr,
+    bt_num_cols,
+    vio_capacity,
     tile_idx,
     COPY_BLOCK_SIZE: tl.constexpr,
     CONV_STATE_DIM_FIRST: tl.constexpr,
     TEMPORAL_TILES: tl.constexpr,
+    PROBE: tl.constexpr = False,
 ):
     """Copy one (layer, state-type) mamba state block between block columns.
 
@@ -238,6 +256,42 @@ def _copy_mamba_state_block(
     state_inner_size = tl.load(state_inner_sizes_ptr + state_idx)
     conv_width = tl.load(state_conv_widths_ptr + state_idx)
 
+    if PROBE:
+        # Column indices index the request's block-table row; a stale or
+        # corrupted column reads a neighbouring row's block id, and the id then
+        # feeds a wild address. Record the offending field and skip the copy
+        # instead of faulting, so the evidence survives the fault.
+        _probe_record(
+            vio_ptr,
+            0,
+            (src_col < 0) | (src_col >= bt_num_cols),
+            src_col,
+            bt_row_idx,
+            vio_capacity,
+        )
+        _probe_record(
+            vio_ptr,
+            1,
+            (dst_col < 0) | (dst_col >= bt_num_cols),
+            dst_col,
+            bt_row_idx,
+            vio_capacity,
+        )
+        _probe_record(
+            vio_ptr,
+            2,
+            (token_bias < 0),
+            token_bias,
+            bt_row_idx,
+            vio_capacity,
+        )
+        if (src_col < 0) | (src_col >= bt_num_cols):
+            return
+        if (dst_col < 0) | (dst_col >= bt_num_cols):
+            return
+        if token_bias < 0:
+            return
+
     # Load the group index for this state, then index into the correct
     # group's block table. Each mamba group has independently allocated
     # physical blocks. Reinterpret as int32* since block ids are int32.
@@ -250,6 +304,18 @@ def _copy_mamba_state_block(
     # below: state_block_stride can exceed 2**31 bytes for large mamba caches,
     # and Triton would otherwise do the multiply in int32 and wrap.
     dest_block_id = tl.load(block_table_base + dst_col).to(tl.int64)
+    if PROBE:
+        num_state_blocks = tl.load(state_num_blocks_ptr + state_idx).to(tl.int64)
+        _probe_record(
+            vio_ptr,
+            3,
+            (dest_block_id < 0) | (dest_block_id >= num_state_blocks),
+            dest_block_id,
+            bt_row_idx,
+            vio_capacity,
+        )
+        if (dest_block_id < 0) | (dest_block_id >= num_state_blocks):
+            return
     dst_addr = state_base_addr + dest_block_id * state_block_stride
 
     is_conv_state = conv_width > 0
@@ -261,6 +327,28 @@ def _copy_mamba_state_block(
             return
         # DS conv layout: state_len is the slide axis; copy per dim row.
         src_block_id = tl.load(block_table_base + src_col).to(tl.int64)
+        if PROBE:
+            num_state_blocks = tl.load(state_num_blocks_ptr + state_idx).to(tl.int64)
+            _probe_record(
+                vio_ptr,
+                4,
+                (src_block_id < 0) | (src_block_id >= num_state_blocks),
+                src_block_id,
+                bt_row_idx,
+                vio_capacity,
+            )
+            _probe_record(
+                vio_ptr,
+                5,
+                token_bias > conv_width,
+                token_bias,
+                bt_row_idx,
+                vio_capacity,
+            )
+            if (src_block_id < 0) | (src_block_id >= num_state_blocks):
+                return
+            if token_bias > conv_width:
+                return
         dim_rows = tl.load(state_dim_row_count_ptr + state_idx)
         row_stride = tl.load(state_dim_row_stride_ptr + state_idx)
         src_block_addr = state_base_addr + src_block_id * state_block_stride
@@ -312,6 +400,28 @@ def _copy_mamba_state_block(
         #   state[bt[src_col], token_bias:] ->
         #   state[bt[dst_col], :conv_width - token_bias]
         src_block_id = tl.load(block_table_base + src_col).to(tl.int64)
+        if PROBE:
+            num_state_blocks = tl.load(state_num_blocks_ptr + state_idx).to(tl.int64)
+            _probe_record(
+                vio_ptr,
+                4,
+                (src_block_id < 0) | (src_block_id >= num_state_blocks),
+                src_block_id,
+                bt_row_idx,
+                vio_capacity,
+            )
+            _probe_record(
+                vio_ptr,
+                5,
+                token_bias > conv_width,
+                token_bias,
+                bt_row_idx,
+                vio_capacity,
+            )
+            if (src_block_id < 0) | (src_block_id >= num_state_blocks):
+                return
+            if token_bias > conv_width:
+                return
         src_block_addr = state_base_addr + src_block_id * state_block_stride
         token_bytes = state_inner_size * state_elem_size
         num_dst_tokens = conv_width - token_bias
@@ -351,6 +461,28 @@ def _copy_mamba_state_block(
     # Body u64 range is partitioned across TEMPORAL_TILES CTAs to keep the
     # SMs filled at small batch.
     actual_src_block_id = tl.load(block_table_base + src_col + token_bias).to(tl.int64)
+    if PROBE:
+        num_state_blocks = tl.load(state_num_blocks_ptr + state_idx).to(tl.int64)
+        _probe_record(
+            vio_ptr,
+            6,
+            (src_col + token_bias) >= bt_num_cols,
+            src_col + token_bias,
+            bt_row_idx,
+            vio_capacity,
+        )
+        _probe_record(
+            vio_ptr,
+            7,
+            (actual_src_block_id < 0) | (actual_src_block_id >= num_state_blocks),
+            actual_src_block_id,
+            bt_row_idx,
+            vio_capacity,
+        )
+        if (src_col + token_bias) >= bt_num_cols:
+            return
+        if (actual_src_block_id < 0) | (actual_src_block_id >= num_state_blocks):
+            return
     src_addr = state_base_addr + actual_src_block_id * state_block_stride
     # Use natural block data size (inner_size * elem_size), NOT
     # state_block_stride which is the page stride and can exceed the
@@ -390,6 +522,10 @@ def postprocess_mamba_fused_kernel(
     # DS conv row metadata. Zero keeps the single-region copy path.
     state_dim_row_count_ptr,  # int32: per-block dim row count for DS conv
     state_dim_row_stride_ptr,  # int64: bytes between rows for DS conv
+    state_num_blocks_ptr,  # int32: blocks in each state tensor (probe bounds)
+    vio_ptr,  # host-mapped violation records (probe)
+    bt_num_cols,  # runtime: block-table row width (probe)
+    vio_capacity,  # runtime: records per check (probe)
     # Output: num_accepted_tokens update (for src==dst case)
     num_accepted_tokens_out_ptr,
     # Optional: batch_idx -> req_idx mapping (V2 model runner / PP). The
@@ -416,6 +552,7 @@ def postprocess_mamba_fused_kernel(
     # 3D grid (num_reqs, total_states, TEMPORAL_TILES). Default 1 preserves
     # the existing 2D-grid contract.
     TEMPORAL_TILES: tl.constexpr = 1,
+    PROBE: tl.constexpr = False,
 ):
     """
     Fused GPU kernel for postprocess_mamba that computes decisions AND performs
@@ -506,10 +643,15 @@ def postprocess_mamba_fused_kernel(
         state_group_indices_ptr,
         state_dim_row_count_ptr,
         state_dim_row_stride_ptr,
+        state_num_blocks_ptr,
+        vio_ptr,
+        bt_num_cols,
+        vio_capacity,
         tile_idx,
         COPY_BLOCK_SIZE,
         CONV_STATE_DIM_FIRST,
         TEMPORAL_TILES,
+        PROBE,
     )
 
 
@@ -577,11 +719,16 @@ def precopy_mamba_align_fused_kernel(
     state_group_indices_ptr,
     state_dim_row_count_ptr,
     state_dim_row_stride_ptr,
+    state_num_blocks_ptr,
+    vio_ptr,
+    bt_num_cols,
+    vio_capacity,
     idx_mapping_ptr,  # [num_reqs] batch_idx -> req_state_idx (-1 to skip)
     num_reqs,
     COPY_BLOCK_SIZE: tl.constexpr,
     CONV_STATE_DIM_FIRST: tl.constexpr,
     HAS_IDX_MAPPING: tl.constexpr = True,
+    PROBE: tl.constexpr = False,
     # TEMPORAL_TILES: see postprocess_mamba_fused_kernel. Default 1 preserves
     # the 2D-grid contract; > 1 requires a 3D grid.
     TEMPORAL_TILES: tl.constexpr = 1,
@@ -638,10 +785,15 @@ def precopy_mamba_align_fused_kernel(
         state_group_indices_ptr,
         state_dim_row_count_ptr,
         state_dim_row_stride_ptr,
+        state_num_blocks_ptr,
+        vio_ptr,
+        bt_num_cols,
+        vio_capacity,
         tile_idx,
         COPY_BLOCK_SIZE,
         CONV_STATE_DIM_FIRST,
         TEMPORAL_TILES,
+        PROBE,
     )
 
 
@@ -809,6 +961,10 @@ class MambaSpecDecodeGPUContext:
     # DS conv row metadata. Zero keeps the single-region copy path.
     state_dim_row_count: torch.Tensor  # int32: per-block dim row count
     state_dim_row_stride: torch.Tensor  # int64: bytes between rows
+    # Probe support: total blocks per state tensor and the block-table row
+    # width, so the copy body can detect a stale column or block id before the
+    # address it would form faults.
+    state_num_blocks: torch.Tensor  # int32: blocks in each state tensor
 
     # Configuration
     block_size: int
@@ -824,6 +980,7 @@ class MambaSpecDecodeGPUContext:
     # table tensors (whose data_ptr is stable across steps).
     block_table_ptrs: torch.Tensor
     block_table_stride_req: int = 0
+    bt_num_cols: int = 0
 
     # persistent output for the once-per-step, all-group aligned-index launch.
     # shape: [num_groups, max_num_reqs, 1 + num_speculative_blocks].
@@ -904,6 +1061,9 @@ class MambaSpecDecodeGPUContext:
             ),
             state_dim_row_stride=torch.zeros(
                 total_states, dtype=torch.int64, device=device
+            ),
+            state_num_blocks=torch.zeros(
+                total_states, dtype=torch.int32, device=device
             ),
             block_size=mamba_spec.block_size,
             num_states=total_states,
@@ -1083,6 +1243,9 @@ class MambaSpecDecodeGPUContext:
                             )
 
                     self.state_group_indices[idx] = group_local_idx
+                    self.state_num_blocks[idx] = (
+                        state.size(0) if state.dim() > 0 else state.numel()
+                    )
                     idx += 1
 
         assert idx == self.num_states
@@ -1099,6 +1262,15 @@ class MambaSpecDecodeGPUContext:
             f"all mamba block tables must share stride(0), got {strides}"
         )
         self.block_table_stride_req = int(next(iter(strides)))
+        self.bt_num_cols = int(block_tables[0].shape[1])
+        logger.info(
+            "mamba align: mamba_block_size=%d block_table_cols=%d row_stride=%d "
+            "state_tensor_blocks=%s",
+            self.block_size,
+            self.bt_num_cols,
+            self.block_table_stride_req,
+            [int(self.state_num_blocks[i]) for i in range(min(3, self.num_states))],
+        )
         for i, bt in enumerate(block_tables):
             self.block_table_ptrs[i] = _reinterpret_u64_as_i64(bt.data_ptr())
 
@@ -1173,6 +1345,9 @@ class MambaSpecDecodeGPUContext:
         )
 
         total_states = self.num_states
+        _probe_view, _probe_cap, _probe_on = _align_probe_args(
+            self.bt_num_cols, self.block_size
+        )
         grid = (num_reqs, total_states, _TEMPORAL_TILES)
 
         postprocess_mamba_fused_kernel[grid](
@@ -1191,6 +1366,10 @@ class MambaSpecDecodeGPUContext:
             self.state_group_indices,
             self.state_dim_row_count,
             self.state_dim_row_stride,
+            self.state_num_blocks,
+            _probe_view,
+            self.bt_num_cols,
+            _probe_cap,
             self.num_accepted_tokens_out,
             None,  # idx_mapping: V1 decision arrays are already in req order
             num_reqs,
@@ -1198,6 +1377,7 @@ class MambaSpecDecodeGPUContext:
             COPY_BLOCK_SIZE=1024,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             TEMPORAL_TILES=_TEMPORAL_TILES,
+            PROBE=_probe_on,
         )
 
     def run_fused_precopy(
@@ -1222,6 +1402,9 @@ class MambaSpecDecodeGPUContext:
         if num_reqs == 0 or not self.is_initialized:
             return
         total_states = self.num_states
+        _probe_view, _probe_cap, _probe_on = _align_probe_args(
+            self.bt_num_cols, self.block_size
+        )
         grid = (num_reqs, total_states, _TEMPORAL_TILES)
         precopy_mamba_align_fused_kernel[grid](
             state_idx_gpu,
@@ -1237,12 +1420,17 @@ class MambaSpecDecodeGPUContext:
             self.state_group_indices,
             self.state_dim_row_count,
             self.state_dim_row_stride,
+            self.state_num_blocks,
+            _probe_view,
+            self.bt_num_cols,
+            _probe_cap,
             idx_mapping,
             num_reqs,
             COPY_BLOCK_SIZE=1024,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             HAS_IDX_MAPPING=idx_mapping is not None,
             TEMPORAL_TILES=_TEMPORAL_TILES,
+            PROBE=_probe_on,
         )
 
     def run_fused_postprocess_align(
@@ -1272,6 +1460,9 @@ class MambaSpecDecodeGPUContext:
         num_accepted_tokens_snapshot.copy_(num_accepted_tokens_gpu)
 
         total_states = self.num_states
+        _probe_view, _probe_cap, _probe_on = _align_probe_args(
+            self.bt_num_cols, self.block_size
+        )
         grid = (num_reqs, total_states, _TEMPORAL_TILES)
         postprocess_mamba_fused_kernel[grid](
             num_accepted_tokens_snapshot,
@@ -1289,6 +1480,10 @@ class MambaSpecDecodeGPUContext:
             self.state_group_indices,
             self.state_dim_row_count,
             self.state_dim_row_stride,
+            self.state_num_blocks,
+            _probe_view,
+            self.bt_num_cols,
+            _probe_cap,
             num_accepted_tokens_gpu,
             idx_mapping,
             num_reqs,
@@ -1298,6 +1493,7 @@ class MambaSpecDecodeGPUContext:
             HAS_IDX_MAPPING=True,
             PRECOMPUTED_NEW_COMPUTED=True,
             TEMPORAL_TILES=_TEMPORAL_TILES,
+            PROBE=_probe_on,
         )
 
 
@@ -1420,6 +1616,26 @@ class _FusedPrecopy(NamedTuple):
     state_idx: CpuGpuBuffer
     src_col: CpuGpuBuffer
     token_bias: CpuGpuBuffer
+
+
+def _align_probe_args(
+    bt_num_cols: int, mamba_block_size: int
+) -> tuple[torch.Tensor | None, int, bool]:
+    """Accelerator view of the violation buffer, its capacity, and the gate."""
+    try:
+        from vllm.utils.gpu_xid_trace import (
+            PROBE_CAPACITY,
+            probe_accel_view,
+            probe_context,
+            probe_tick,
+        )
+
+        probe_context(bt_num_cols=bt_num_cols, mamba_block_size=mamba_block_size)
+        probe_tick()
+        view = probe_accel_view()
+        return view, PROBE_CAPACITY, view is not None
+    except Exception:
+        return None, 0, False
 
 
 def _resolve_fused_precopy(

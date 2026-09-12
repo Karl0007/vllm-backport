@@ -7,7 +7,7 @@ This fires N distinct long needle prompts simultaneously -- each with its own
 passphrase -- and checks every one comes back with ITS OWN needle, which would
 fail if row offsets bled across requests.
 """
-import argparse
+import argparse, os
 import concurrent.futures as cf
 import json
 import random
@@ -43,7 +43,8 @@ def one(idx, port, model, approx, timeout):
         f"http://127.0.0.1:{port}/v1/completions",
         json.dumps({"model": model, "prompt": prompt, "max_tokens": 24,
                     "temperature": 0}).encode(),
-        {"Content-Type": "application/json"},
+        {"Content-Type": "application/json",
+         "Authorization": f"Bearer {os.environ.get('BENCH_API_KEY', '')}"},
     )
     t0 = time.perf_counter()
     try:

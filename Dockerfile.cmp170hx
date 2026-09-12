@@ -31,6 +31,24 @@ RUN python3 -c "import vllm,os,sys,hashlib;q=os.path.dirname(vllm.__file__);\
 d=hashlib.md5(open('/tmp/vllm_tree_check/__init__.py','rb').read()).hexdigest();\
 i=hashlib.md5(open(os.path.join(q,'__init__.py'),'rb').read()).hexdigest();\
 sys.exit(0 if d==i else (sys.stderr.write(f'BASE DRIFT {d} != {i}\n') or 1))"
+COPY vllm/utils/gpu_xid_trace.py /tmp/gpu_xid_trace.py
+RUN python3 -c "import vllm,os,shutil; shutil.copy2('/tmp/gpu_xid_trace.py', os.path.join(os.path.dirname(vllm.__file__), 'utils/gpu_xid_trace.py'))"
+COPY vllm/utils/gpu_xid_mark.py /tmp/gpu_xid_mark.py
+RUN python3 -c "import vllm,os,shutil; shutil.copy2('/tmp/gpu_xid_mark.py', os.path.join(os.path.dirname(vllm.__file__), 'utils/gpu_xid_mark.py'))"
+COPY vllm/v1/worker/mamba_utils.py /tmp/mamba_utils.py
+RUN python3 -c "import vllm,os,shutil; shutil.copy2('/tmp/mamba_utils.py', os.path.join(os.path.dirname(vllm.__file__), 'v1/worker/mamba_utils.py'))"
+COPY vllm/v1/worker/gpu/model_states/mamba_hybrid.py /tmp/mamba_hybrid.py
+RUN python3 -c "import vllm,os,shutil; shutil.copy2('/tmp/mamba_hybrid.py', os.path.join(os.path.dirname(vllm.__file__), 'v1/worker/gpu/model_states/mamba_hybrid.py'))"
+COPY vllm/models/glm5next/nvidia/model.py /tmp/glm_model.py
+RUN python3 -c "import vllm,os,shutil; shutil.copy2('/tmp/glm_model.py', os.path.join(os.path.dirname(vllm.__file__), 'models/glm5next/nvidia/model.py'))"
+COPY vllm/third_party/flash_linear_attention/ops/index.py /tmp/fla_index.py
+RUN python3 -c "import vllm,os,shutil; shutil.copy2('/tmp/fla_index.py', os.path.join(os.path.dirname(vllm.__file__), 'third_party/flash_linear_attention/ops/index.py'))"
+COPY vllm/third_party/flash_linear_attention/ops/kda.py /tmp/fla_kda.py
+RUN python3 -c "import vllm,os,shutil; shutil.copy2('/tmp/fla_kda.py', os.path.join(os.path.dirname(vllm.__file__), 'third_party/flash_linear_attention/ops/kda.py'))"
+COPY vllm/model_executor/layers/sparse_attn_indexer.py /tmp/indexer.py
+RUN python3 -c "import vllm,os,shutil; shutil.copy2('/tmp/indexer.py', os.path.join(os.path.dirname(vllm.__file__), 'model_executor/layers/sparse_attn_indexer.py'))"
+COPY vllm/model_executor/layers/sparse_attn_indexer_kpool.py /tmp/indexer_kpool.py
+RUN python3 -c "import vllm,os,shutil; shutil.copy2('/tmp/indexer_kpool.py', os.path.join(os.path.dirname(vllm.__file__), 'model_executor/layers/sparse_attn_indexer_kpool.py'))"
 
 # Deployment layer (no vllm/ overlay on this line).
 COPY launch-dsv4.sh launch-glm.sh launch-qwen.sh fetch-glm-awq.sh \

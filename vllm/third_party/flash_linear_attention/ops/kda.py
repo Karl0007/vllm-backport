@@ -15,6 +15,12 @@ import torch.nn as nn
 from vllm.model_executor.custom_op import CustomOp
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import RCP_LN2, cdiv, next_power_of_2
+from vllm.utils.gpu_xid_trace import (
+    check_monotonic,
+    emit,
+    sync_point,
+    tensor_summary,
+)
 
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from .cumsum import chunk_local_cumsum
@@ -1299,6 +1305,17 @@ def fused_kda_gate_chunk_cumsum(
             "Only batch size 1 is supported when cu_seqlens are provided"
         )
     B, T, H, D = raw_g.shape
+    emit(
+        "kda.gate_chunk.begin",
+        B=B,
+        T=T,
+        H=H,
+        D=D,
+        chunk_size=chunk_size,
+        cu_seqlens=tensor_summary("cu_seqlens", cu_seqlens),
+    )
+    check_monotonic("kda.gate_chunk", cu_seqlens, "cu_seqlens")
+    sync_point("kda.chunk.pre")
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     NT = cdiv(T, chunk_size) if cu_seqlens is None else len(chunk_indices)
@@ -1472,7 +1489,7 @@ def chunk_kda_with_fused_gate_fwd(
         chunk_size=chunk_size,
         lower_bound=lower_bound,
     )
-    return _chunk_kda_fwd_with_cumulative_g(
+    result = _chunk_kda_fwd_with_cumulative_g(
         q=q,
         k=k,
         v=v,
@@ -1485,6 +1502,8 @@ def chunk_kda_with_fused_gate_fwd(
         chunk_indices=chunk_indices,
         chunk_size=chunk_size,
     )
+    sync_point("kda.chunk.post")
+    return result
 
 
 def chunk_kda(

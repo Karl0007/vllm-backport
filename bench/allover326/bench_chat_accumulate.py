@@ -22,7 +22,7 @@ THREE OUTPUTS
 Results stream to JSONL as they happen -- a crash at turn 180 must not cost the
 first 179 turns.
 """
-import argparse, json, os, random, re, time, urllib.request
+import argparse, os, json, os, random, re, time, urllib.request
 from collections import Counter
 
 # ---------------------------------------------------------------- canaries
@@ -110,7 +110,8 @@ def chat_stream(port, model, messages, max_tokens, timeout, want_logprobs=True,
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/chat/completions",
         data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"})
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {os.environ.get('BENCH_API_KEY', '')}"})
 
     t0 = time.time()
     ttft = None

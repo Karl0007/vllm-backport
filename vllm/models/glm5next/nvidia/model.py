@@ -84,6 +84,8 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
+from vllm.utils.gpu_xid_trace import mark as _trace_mark
+from vllm.utils.gpu_xid_trace import mark_prepare_accel as _mark_prepare
 
 from .attention import Glm5NextMLAAttention
 from .kda import Glm5NextLinearAttention
@@ -94,6 +96,20 @@ from .multimodal import (
 )
 
 logger = init_logger(__name__)
+
+_MARK_VIEW: object | None = None
+
+
+def _attn_mark_view():
+    """Accelerator-side view of the stage-marker buffer (created once)."""
+    global _MARK_VIEW
+    if _MARK_VIEW is None:
+        _MARK_VIEW = _mark_prepare()
+    return _MARK_VIEW
+
+
+def _mark(layer_idx: int, phase: int) -> None:
+    _trace_mark(_attn_mark_view(), int(layer_idx), int(phase))
 
 
 class Glm5NextMLP(nn.Module):
@@ -444,6 +460,7 @@ class Glm5NextDecoderLayer(nn.Module):
         # hc_post with this layer's attn hc_pre into one kernel (inter-layer
         # fusion). Layer 0 has no incoming state -> standalone hc_pre.
         x = hidden_states
+        _mark(self.layer_idx, 0)
         if post is None:
             if self.layer_idx == 0:
                 x = hc_expand(x, self.n)
@@ -478,6 +495,7 @@ class Glm5NextDecoderLayer(nn.Module):
             hidden_states=x,
             positions=positions,
         )
+        _mark(self.layer_idx, 1)
 
         if self.is_sequence_parallel:
             x = sp_reduce_scatter(x)
@@ -500,6 +518,7 @@ class Glm5NextDecoderLayer(nn.Module):
             x = self.mlp(x, already_sequence_parallel=self.is_sequence_parallel)
         else:
             x = self.mlp(x)
+        _mark(self.layer_idx, 2)
 
         # mHC end. The last mHC layer materializes its final hc_post (nothing
         # to fuse with) then contracts; every other layer defers its hc_post to

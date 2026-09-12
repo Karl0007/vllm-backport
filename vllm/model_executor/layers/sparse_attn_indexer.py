@@ -35,6 +35,14 @@ from vllm.utils.deep_gemm import (
     is_deep_gemm_supported,
 )
 from vllm.utils.import_utils import has_cutedsl
+from vllm.utils.gpu_xid_trace import (
+    check_bounds,
+    emit,
+    note_violation_call,
+    sync_point,
+    tensor_summary,
+    violation_accel_views,
+)
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -206,11 +214,14 @@ def _fused_indexer_q_rope_quant_kernel(
     weights_out,
     weights_out_s0,
     weights_out_s1,
+    vio_slots,
+    pos_limit,
     softmax_scale,
     head_scale,
     fp8_min: tl.constexpr,
     fp8_max: tl.constexpr,
     is_neox: tl.constexpr,
+    CHECK: tl.constexpr,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
@@ -218,6 +229,15 @@ def _fused_indexer_q_rope_quant_kernel(
     offs64 = tl.arange(0, 64)
 
     pos = tl.load(positions + token)
+    if CHECK:
+        # This kernel launches over the padded token rows, but only the rows
+        # covered by the current batch have live positions; the tail keeps
+        # whatever the previous step wrote. Both this load and the cache read
+        # below are unmasked, so an out-of-range position is an illegal read.
+        # Record it in host memory and neutralize the rotation instead.
+        if (pos < 0) | (pos >= pos_limit):
+            tl.store(vio_slots + 1 + token, pos)
+            pos = 0
     cos = tl.load(cos_sin_cache + pos * cos_sin_s0 + offs32).to(tl.float32)
     sin = tl.load(cos_sin_cache + pos * cos_sin_s0 + 32 + offs32).to(tl.float32)
     q_base = q + token * q_s0 + head * q_s1
@@ -290,6 +310,27 @@ def fused_indexer_q_rope_quant(
     q_fp8 = torch.empty_like(q, dtype=current_platform.fp8_dtype())
     weights_out = torch.empty_like(weights, dtype=torch.float32)
     fp8_min, fp8_max = get_fp8_min_max()
+    emit(
+        "indexer.q_rope.begin",
+        tokens=int(q.shape[0]),
+        heads=int(q.shape[1]),
+        cos_sin_rows=int(cos_sin_cache.shape[0]),
+        positions=tensor_summary("positions", positions),
+    )
+    sync_point("indexer.q_rope.pre")
+    check_bounds(
+        "indexer.q_rope.positions",
+        positions,
+        0,
+        int(cos_sin_cache.shape[0]),
+        "positions",
+    )
+    vio_slots, _vio_meta = violation_accel_views()
+    check_enabled = (
+        vio_slots is not None and q.shape[0] + 1 <= int(vio_slots.numel())
+    )
+    if check_enabled:
+        note_violation_call(int(q.shape[0]), int(cos_sin_cache.shape[0]))
     _fused_indexer_q_rope_quant_kernel[(q.shape[0], q.shape[1])](
         positions,
         q,
@@ -306,13 +347,17 @@ def fused_indexer_q_rope_quant(
         weights_out,
         weights_out.stride(0),
         weights_out.stride(1),
+        vio_slots if check_enabled else positions,
+        int(cos_sin_cache.shape[0]),
         softmax_scale,
         head_scale,
         fp8_min=fp8_min,
         fp8_max=fp8_max,
         is_neox=is_neox,
+        CHECK=check_enabled,
         num_warps=1,
     )
+    sync_point("indexer.q_rope.post")
     return q_fp8, weights_out
 
 

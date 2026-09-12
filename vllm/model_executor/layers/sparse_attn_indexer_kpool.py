@@ -14,6 +14,12 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
+from vllm.utils.gpu_xid_trace import (
+    check_bounds,
+    emit,
+    sync_point,
+    tensor_summary,
+)
 
 if TYPE_CHECKING:
     from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
@@ -381,6 +387,16 @@ def sparse_attn_indexer_kpool(
     # size while slot_mapping only covers actual tokens. Truncate k to avoid
     # out-of-bounds reads in the kernel.
     num_tokens = slot_mapping.shape[0]
+    emit(
+        "indexer.kpool.begin",
+        num_tokens=num_tokens,
+        hidden_tokens=int(hidden_states.shape[0]),
+        num_decode_tokens=num_decode_tokens,
+        index_kpool=index_kpool,
+        positions=tensor_summary("positions", positions),
+        slot_mapping=tensor_summary("slot_mapping", slot_mapping),
+    )
+    sync_point("indexer.kpool.pre")
     if k is not None:
         k = k[:num_tokens]
 
@@ -948,6 +964,7 @@ def sparse_attn_indexer_kpool(
             )
         topk_indices_buffer[: out.shape[0], : out.shape[-1]] = out
 
+    sync_point("indexer.kpool.post")
     return topk_indices_buffer
 
 
