@@ -243,21 +243,11 @@ class MambaHybridModelState(DefaultModelState):
                 )
         if self._pending_state_seed:
             # Seed from the resumed position with the mamba block size, before any
-            # kernel reads state_idx. Only slots that are live in this batch are
-            # seeded: a pending entry belongs to the request that was added last step,
-            # so if that request is gone (preempted/finished) the entry must be
-            # dropped rather than applied to a slot some other request now owns --
-            # that would silently seed a wrong state column.
-            live = set()
-            if input_batch.idx_mapping is not None:
-                live = {int(v) for v in input_batch.idx_mapping[:num_reqs].tolist() if v >= 0}
-            else:
-                live = set(range(num_reqs))
+            # kernel reads state_idx.
             for idx, num_computed in self._pending_state_seed.items():
-                if idx in live:
-                    self._mamba_state_idx_gpu[idx].fill_(
-                        max(0, (num_computed - 1) // self._mamba_block_size)
-                    )
+                self._mamba_state_idx_gpu[idx].fill_(
+                    max(0, (num_computed - 1) // self._mamba_block_size)
+                )
             self._pending_state_seed.clear()
         ctx = self._ensure_align_ctx(kv_cache_config, mamba_group_ids, block_tables)
 
