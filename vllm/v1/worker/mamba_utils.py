@@ -1242,6 +1242,12 @@ class MambaSpecDecodeGPUContext:
         """
         if num_reqs == 0 or not self.is_initialized:
             return
+        import os as _os
+
+        if _os.environ.get("VLLM_MAMBA_SKIP_ALIGN_PRECOPY", "0") == "1":
+            # DIAGNOSTIC ONLY (never ship): skip the align pre-copy to test whether
+            # this kernel is the fault site.
+            return
         total_states = self.num_states
         grid = (num_reqs, total_states, _TEMPORAL_TILES)
         precopy_mamba_align_fused_kernel[grid](
@@ -1285,6 +1291,13 @@ class MambaSpecDecodeGPUContext:
         ``idx_mapping`` maps batch row -> req-state slot (HAS_IDX_MAPPING).
         """
         if num_reqs == 0 or not self.is_initialized:
+            return
+        import os as _os
+
+        if _os.environ.get("VLLM_MAMBA_SKIP_ALIGN_SAVE", "0") == "1":
+            # DIAGNOSTIC ONLY (never ship): skip the acceptance save to test whether
+            # this kernel is the fault site. Prefix-cache resumes then read stale
+            # states, so outputs can degrade -- only use it to localise.
             return
 
         # V2 reads non-contiguous idx_mapping positions, so snapshot the whole

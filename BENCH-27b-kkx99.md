@@ -516,3 +516,13 @@
 #   代价：短上下文 harness 80.3 tok/s（k=7 为 169 ✗）。
 #   结论：配置层没有"保留全部 feature 且稳定"的解 ✗ —— 唯一干净配置是 SPEC=none（长上下文
 #   掉回 21.8 tok/s ✗）。修复只能来自上游级改动（见根目录 UPSTREAM-report-mamba-align-spec-xid31.md）。
+
+# 【2026-09-13 06:4x 两个 align 内核都被排除（诊断性跳过）】
+#   用 env 门控的诊断开关（默认关闭、绝不发布）分别跳过：
+#     VLLM_MAMBA_SKIP_ALIGN_SAVE=1    -> 同一序列 r5/96K 仍崩 ✗（postprocess 回存不是触发点）
+#     VLLM_MAMBA_SKIP_ALIGN_PRECOPY=1 -> 同一序列 r5/96K 仍崩 ✗（precopy 也不是触发点）
+#   同时修正一条此前的弱结论：SPEC=none 的"干净"只有 16 发（若真实故障率 1/12，概率 25% ✗），
+#   所以"投机专属"并不成立；更可能是**投机提高跨块频率**从而放大暴露 ✗。
+#   剩余嫌疑：GDN/conv 层内核、mamba 状态写入（mamba_attn 侧）、reshape_and_cache，
+#   或图重放下的整体顺序。下一步建议：eager + CUDA_LAUNCH_BLOCKING 跑满 ~24 个长请求
+#   （eager 目前只在 16 发内干净过 ✗），若也崩即可用栈精确归属内核。
