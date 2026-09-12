@@ -263,6 +263,13 @@ def _copy_mamba_state_block(
     if src_col + token_bias >= table_width:
         return
     dest_block_id = tl.load(block_table_base + dst_col).to(tl.int64)
+    # Loud on purpose and unconditional: this runs only when a copy actually happens
+    # (src_col >= 0 and src_col != dst_col), so the volume is bounded, and it is the
+    # last uninstrumented hop before the state bytes are addressed.
+    tl.device_print(
+        "COPY_K state_idx=", state_idx, " src_col=", src_col, " dst_col=", dst_col,
+        " bias=", token_bias, " width=", table_width, " dst_blk=", dest_block_id,
+    )
     dst_addr = state_base_addr + dest_block_id * state_block_stride
 
     is_conv_state = conv_width > 0
@@ -274,6 +281,7 @@ def _copy_mamba_state_block(
             return
         # DS conv layout: state_len is the slide axis; copy per dim row.
         src_block_id = tl.load(block_table_base + src_col).to(tl.int64)
+        tl.device_print("COPY_K src_blk=", src_block_id, " bt_row=", bt_row_idx)
         dim_rows = tl.load(state_dim_row_count_ptr + state_idx)
         row_stride = tl.load(state_dim_row_stride_ptr + state_idx)
         src_block_addr = state_base_addr + src_block_id * state_block_stride
