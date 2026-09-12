@@ -5,25 +5,41 @@
 # else is used AS IS. Assertions pin the fixes this line must contain
 # (verified at port time, 2026-09-11, origin/master a350766628):
 #
+# checklist below was re-derived on 2026-09-12 by auditing every commit the
+# v0.11 line carries (git log origin/master..cmp170hx, 22 commits) against this
+# tree; each one is carried, upstream-carried, deliberately dropped, or listed
+# as a known gap. Keep it that way: the previous checklist claimed the
+# align-mode seed divisor was upstream-carried because the file cites
+# vllm#53142, and that single wrong entry cost a production-line Xid 13.
+#
 # carried upstream (no local patch needed):
 #   - PR #63 PP+MTP+prefix-cache mamba state corruption: align copy kernels
 #     index rows by req_idx (mamba_utils.py) + runner binds ctx to the SOURCE
-#     req-indexed tables (gpu/model_runner.py preprocess_state)
+#     req-indexed tables (mamba_hybrid.py _ensure_align_ctx)
 #   - #55223 reasoning-end offset scan (v1/structured_output + parser/)
-#   - GLM PP mHC hand-off + MTP embed-from-checkpoint (d09b08caf5)
+#   - GLM PP mHC hand-off + MTP draft embedding (upstream d09b08caf5 ported the
+#     fork deltas; the drafter now shares/loads its embedding via
+#     eagle/utils.py maybe_share_target_embed instead of the old
+#     load-from-checkpoint helper)
 #   - Qwen UVA PLE pinned-host offload (replaces PleOffloadWorker; the
 #     VLLM_PP_LAYER_PARTITION clear patch is obsolete: no offload subprocess)
 # patched locally (overlay below):
-#   - mamba_hybrid.py align-mode state column divisor. The port checklist
-#     assumed upstream carried the vllm#53142 seed fix because the file cites
-#     that issue; it does not. Upstream divides by
+#   - mamba_hybrid.py align-mode state column divisor. Upstream divides by
 #     `cache_config.mamba_block_size or cache_config.block_size`, which on a
 #     hybrid engine is smaller than the mamba group's aligned page (16 vs 4480
 #     here), so a prefix-cache resume seeded a column up to 280x too large --
 #     outside the block-table row -- and the align pre-copy read a garbage
-#     block id (Xid 13). The v0.11.2 line fixed this in 1cdd6bc316.
+#     block id (Xid 13). The v0.11 line fixed this in 1cdd6bc316.
 #   - flash_linear_attention/ops/index.py: derive per-step chunk metadata on
 #     every call instead of caching it by tensor identity.
+# known gap, not carried (revisit trigger in the entry):
+#   - csrc alignment traps (v0.11 083b4aeab2): __trap() guards on the raw
+#     float4/float2 casts in csrc/libtorch_stable/{cache_kernels.cu,
+#     persistent_topk.cuh}. They are C++ and cannot ride the Python overlay --
+#     carrying them means rebuilding _C_stable_libtorch.abi3.so. Value: turns
+#     a misaligned-access Xid 13 into a named kernel error, which is the only
+#     in-process localization we have on this part (no compute-sanitizer).
+#     Revisit if any misaligned-address Xid appears on this line.
 # deliberately NOT re-ported:
 #   - #45015 PP bitmask drain: the 0.13 port rewired structured output under
 #     async scheduling to a placeholder design (pending_structured_output_tokens
@@ -33,6 +49,7 @@
 #   - vllm#48375 MambaManager extra block drop: upstream get_replay_boundaries
 #     (#53945/#54713) retains the checkpoint at the post-drop candidate; the
 #     extra drop zeroed resends (a47f0f82d5).
+
 FROM dockerproxy.net/lazymio/vllm-backport:latest-sm80
 
 # Pin the base to the exact tree this branch was verified against.
