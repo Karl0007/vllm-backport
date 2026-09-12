@@ -42,28 +42,13 @@ d=hashlib.md5(open('/tmp/vllm_tree_check/__init__.py','rb').read()).hexdigest();
 i=hashlib.md5(open(os.path.join(q,'__init__.py'),'rb').read()).hexdigest();\
 sys.exit(0 if d==i else (sys.stderr.write(f'BASE DRIFT {d} != {i}\n') or 1))"
 
-# Local vllm/ patches (this line is no longer upstream-identical).
+# Local vllm/ patches (this line is no longer upstream-identical). Run from a
+# copied script, not an inline heredoc: this builder does not expand heredocs,
+# so `RUN python3 - <<'EOF'` silently runs nothing and reports success.
 COPY vllm/v1/worker/gpu/model_states/mamba_hybrid.py /tmp/vllm_patch/mamba_hybrid.py
 COPY vllm/third_party/flash_linear_attention/ops/index.py /tmp/vllm_patch/fla_index.py
-RUN python3 - <<'EOF'
-import importlib, os, shutil
-root = os.path.dirname(importlib.import_module("vllm").__file__)
-targets = {
-    "/tmp/vllm_patch/mamba_hybrid.py": "v1/worker/gpu/model_states/mamba_hybrid.py",
-    "/tmp/vllm_patch/fla_index.py": "third_party/flash_linear_attention/ops/index.py",
-}
-for src, rel in targets.items():
-    shutil.copy2(src, os.path.join(root, rel))
-
-mh = open(os.path.join(root, "v1/worker/gpu/model_states/mamba_hybrid.py")).read()
-assert "self._mamba_block_size = int(mamba_spec.block_size)" in mh, (
-    "align state column divisor must come from the resolved mamba spec"
-)
-assert "_pending_state_seed" in mh, "deferred resume seeding missing"
-idx = open(os.path.join(root, "third_party/flash_linear_attention/ops/index.py")).read()
-assert "tensor_cache" not in idx, "per-step chunk metadata is cached by identity again"
-print("local vllm/ patches applied")
-EOF
+COPY deploy/apply-vllm-patches.py /tmp/vllm_patch/apply-vllm-patches.py
+RUN python3 /tmp/vllm_patch/apply-vllm-patches.py /tmp/vllm_patch
 
 # Deployment layer.
 COPY launch-dsv4.sh launch-glm.sh launch-qwen.sh fetch-glm-awq.sh \
@@ -71,60 +56,5 @@ COPY launch-dsv4.sh launch-glm.sh launch-qwen.sh fetch-glm-awq.sh \
 COPY bench/ /opt/cmp17hx/bench/
 RUN chmod +x /opt/cmp17hx/*.sh /opt/cmp17hx/bench/*.py 2>/dev/null || true
 
-RUN python3 - <<'EOF'
-import importlib, os, sys
-mods = [
-    "vllm.models.glm5next.nvidia.model",
-    "vllm.models.qwen4_exp.nvidia.model_state",
-    "vllm.models.qwen4_exp.nvidia.ngram_embedding",
-    "vllm.v1.worker.gpu.spec_decode.eagle.utils",
-    "vllm.v1.core.sched.async_scheduler",
-]
-for m in mods:
-    importlib.import_module(m)
-
-# Text assertions (triton JIT objects / plain scripts): the fixes this line
-# is required to carry upstream.
-root = os.path.dirname(importlib.import_module("vllm").__file__)
-read = lambda *p: open(os.path.join(root, *p)).read()
-
-# PR #63: kernels index the SOURCE req-indexed tables by req_idx.
-mu = read("v1", "worker", "mamba_utils.py")
-assert "bt_row_idx = req_idx" in mu, "mamba postprocess still indexes batch rows"
-assert "HAS_IDX_MAPPING else req_idx" not in mu, "stale batch-row indexing is back"
-assert "Source tables are req-indexed" in mu, "mamba precopy still indexes batch rows"
-
-# PR #63 runner half: ctx bound to source tables in preprocess_state.
-mr = read("v1", "worker", "gpu", "model_runner.py")
-assert "tuple(bt.gpu for bt in self.block_tables.block_tables)" in mr, (
-    "mamba ctx not bound to source block tables"
-)
-
-# vllm#53142: state-seed divisor is the mamba group block size.
-mh = read("v1", "worker", "gpu", "model_states", "mamba_hybrid.py")
-assert "self._mamba_block_size" in mh, "mamba state seed uses CLI block size divisor"
-
-# #55223: reasoning-end offset scan present.
-so = read("v1", "structured_output", "__init__.py")
-assert "find_reasoning_end_offset" in so, "#55223 reasoning-offset scan missing"
-
-# GLM PP hand-off + MTP embed-from-checkpoint.
-gm = read("models", "glm5next", "nvidia", "model.py")
-assert "mHC" in gm or "mhc" in gm, "GLM PP mHC hand-off missing"
-mt = read("models", "glm5next", "nvidia", "mtp.py")
-assert "PPMissingLayer" in mt or "pp_missing" in mt.lower(), (
-    "MTP draft embed-from-checkpoint (PP) missing"
-)
-
-# Qwen UVA PLE offload replaces the PleOffloadWorker design.
-ne = read("models", "qwen4_exp", "nvidia", "ngram_embedding.py")
-assert "Qwen4ExpPLEPinnedHostEmbedding" in ne, "UVA PLE offload missing"
-assert "is_uva_available" in ne, "UVA guard missing"
-
-# Deliberate omissions (fail the build if someone re-ports them):
-st = read("v1", "core", "single_type_kv_cache_manager.py")
-assert "max_length = max(0, max_length - kv_cache_spec.block_size)" not in st, (
-    "re-ported #48375 extra block drop upstream rejects (a47f0f82d5)"
-)
-print("overlay assertions OK")
-EOF
+COPY deploy/verify-vllm-tree.py /tmp/vllm_patch/verify-vllm-tree.py
+RUN python3 /tmp/vllm_patch/verify-vllm-tree.py
