@@ -1,6 +1,44 @@
 # Derived runtime: lazymio/vllm-backport:v0.13.0-sm80 (prebuilt sm80 wheel, built
-# from origin/master at tag v0.13.0) + the cmp170hx branch's vllm/ PYTHON tree
-# overlaid wholesale.
+# from origin/master at tag v0.13.0) + this checkout's vllm/ PYTHON tree overlaid
+# wholesale + the deployment files.
+#
+# Two v0.13 derivations existed and were merged on 2026-09-12:
+#   - this line (overlay): the python tree is overlaid wholesale, because the
+#     production checkpoint needs hunks the base image does not carry:
+#       qwen3_5.py / qwen3_5_mtp.py  embed-quant (eq8emb checkpoints need
+#                                    quant_config on VocabParallelEmbedding)
+#       qwen3_dflash.py              vllm#51620, DFlash with a quantized drafter
+#     Plus the line's ports (#48375, #45015, marlin int8 set, csrc traps).
+#   - karl/cmp170hx-v013 (no overlay, merged in here): base
+#     lazymio/vllm-backport:latest-sm80 (v0.13.0, upstream 93911fcf68) used AS IS
+#     with a deployment-only overlay, its tree pinned by hash + text assertions.
+#     That line requires these to be carried upstream (verified 2026-09-11
+#     against origin/master a350766628; assertions for them are kept below):
+#       PR #63 PP+MTP+prefix-cache mamba state corruption (mamba_utils copy
+#         kernels index the SOURCE req-indexed tables by req_idx; runner binds
+#         ctx to those tables in preprocess_state)
+#       vllm#53142 state-seed divisor = mamba group block size
+#       #55223 reasoning-end offset scan (v1/structured_output + parser/)
+#       GLM PP mHC hand-off + MTP draft embed-from-checkpoint
+#       Qwen UVA PLE pinned-host offload (replaces PleOffloadWorker; the
+#         VLLM_PP_LAYER_PARTITION clear patch is obsolete: no offload subprocess)
+#     It cannot serve our eq8emb checkpoint: with no python overlay, load dies
+#     with "no parameter named 'embed_tokens.weight_packed'". The overlay is a
+#     load requirement on this box, not a preference.
+#
+# Open disagreements inherited from that line's notes -- NOT yet re-verified on
+# this tree, do not delete without checking:
+#   - vllm#48375 MambaManager extra block drop: that line deliberately does NOT
+#     apply it, because upstream get_replay_boundaries (#53945/#54713) retains the
+#     checkpoint at the post-drop candidate and the extra drop zeroed resends
+#     (a47f0f82d5). This line applies it and asserts it below. Re-verify against
+#     the v0.13.0 tree before trusting either.
+#   - #45015 PP bitmask drain: that line dropped it (the 0.13 port rewired
+#     structured output under async scheduling to a placeholder design:
+#     pending_structured_output_tokens + num_output_placeholders); this line
+#     ports the scheduler hook + engine drain and asserts them below. Re-evaluate
+#     against live traffic; the orchestrator's request-level 502 guard is the
+#     standing safety net.
 #
 # Only vllm/**.py is overlaid; the compiled _C.abi3.so comes from the base, so
 # csrc/ changes carried by this branch (the fail-fast alignment traps) are NOT in
@@ -8,6 +46,7 @@
 # against the base below (BASE DRIFT guard).
 FROM dockerproxy.net/lazymio/vllm-backport:v0.13.0-sm80
 
+# Pin the base to the exact tree this branch was verified against.
 COPY vllm/__init__.py /tmp/vllm_tree_check/__init__.py
 RUN python3 -c "import vllm,os,sys,hashlib;q=os.path.dirname(vllm.__file__);\
 d=hashlib.md5(open('/tmp/vllm_tree_check/__init__.py','rb').read()).hexdigest();\
@@ -15,8 +54,17 @@ i=hashlib.md5(open(os.path.join(q,'__init__.py'),'rb').read()).hexdigest();\
 sys.exit(0 if d==i else (sys.stderr.write(f'BASE DRIFT {d} != {i}\n') or 1))"
 
 # Wholesale Python overlay (base verified identical to fb4a3d9; branch adds
-# PR#44 + GLM PP handoff + MTP embed-from-checkpoint + Qwen PLE PP unlocks).
+# PR#44 + GLM PP handoff + MTP embed-from-checkpoint + Qwen PLE PP unlocks +
+# the embed-quant / qwen3_dflash hunks).
 COPY vllm/ /usr/local/lib/python3.12/dist-packages/vllm/
+
+# Deployment layer, kept from the merged no-overlay line: launchers + bench for
+# boxes that run the image directly. The kk-x99 worker still bind-mounts its own
+# launcher per file (see launch-27b-kkx99.sh), which wins over this copy.
+COPY launch-dsv4.sh launch-glm.sh launch-qwen.sh fetch-glm-awq.sh \
+     verify_correctness.sh /opt/cmp17hx/
+COPY bench/ /opt/cmp17hx/bench/
+RUN chmod +x /opt/cmp17hx/*.sh /opt/cmp17hx/bench/*.py 2>/dev/null || true
 
 RUN python3 - <<'EOF'
 import importlib, os, sys
@@ -25,7 +73,9 @@ read = lambda *p: open(os.path.join(root, *p)).read()
 mods = [
     "vllm.models.glm5next.nvidia.model",
     "vllm.models.qwen4_exp.nvidia.model_state",
+    "vllm.models.qwen4_exp.nvidia.ngram_embedding",
     "vllm.v1.worker.gpu.spec_decode.eagle.utils",
+    "vllm.v1.core.sched.async_scheduler",
 ]
 # importlib-only checks (no CUDA); model modules pull config/nn deps fine
 for m in mods:
@@ -49,6 +99,7 @@ assert "tuple(bt.gpu for bt in self.block_tables.block_tables)" in mr, (
 )
 # vllm#48375 (unmerged): MambaManager must honour drop_eagle_block, else a
 # prefix-cache resume lands on state snapshotted over rejected draft tokens.
+# (Contested: see the header.)
 sm = read("v1", "core", "single_type_kv_cache_manager.py")
 assert "max_length = max(0, max_length - kv_cache_spec.block_size)" in sm, (
     "MambaManager ignores drop_eagle_block"
@@ -63,10 +114,18 @@ so = read("v1", "structured_output", "__init__.py")
 assert "find_reasoning_end_offset" in so, "#55223 reasoning-offset scan missing"
 # #45015 (upstream PR, open): deferred bitmask must drain in-flight batches
 # until structured FSMs catch up, else PP+async samples from a stale FSM.
+# (Contested: see the header.)
 sc = read("v1", "core", "sched", "scheduler.py")
 ec = read("v1", "engine", "core.py")
 assert "def has_structured_output_in_flight" in sc, "#45015 scheduler hook missing"
 assert "has_structured_output_in_flight(" in ec, "#45015 bitmask drain missing"
+# GLM PP mHC hand-off + MTP draft embed-from-checkpoint, as the no-overlay line
+# verified against its base (kept here as a tripwire for the same upstreams).
+gmp = read("models", "glm5next", "nvidia", "model.py")
+assert "mHC" in gmp or "mhc" in gmp, "GLM PP mHC hand-off missing"
+ne = read("models", "qwen4_exp", "nvidia", "ngram_embedding.py")
+assert "Qwen4ExpPLEPinnedHostEmbedding" in ne, "UVA PLE offload missing"
+assert "is_uva_available" in ne, "UVA guard missing"
 # syv-ai's marlin set (int8 tensor-core GEMMs on Ampere): per-layer int8 activation
 # selection, negative-scale handling, staged sm80 repack, and the tune table.
 assert "VLLM_MARLIN_INT8_INCLUDE_RE" in read("envs.py"), "marlin int8 layer select missing"
