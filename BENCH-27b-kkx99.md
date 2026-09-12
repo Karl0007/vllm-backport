@@ -535,3 +535,11 @@
 #   剩余唯一取证手段（都较重）：① cuda-gdb 附加到重放（或对捕获图做内核级断点）；
 #   ② UVA/共享内存缓冲：内核内无条件写入关键标量，由独立进程读（崩溃后仍可读）✗。
 #   两条都未尝试（本轮预算已尽）✗。
+
+# 【2026-09-13 07:3x 再排除两项】
+#   ASYNC_SCHED=0（同步调度，其余同）：同一序列 r5/96K 仍崩 ✗ -> 异步调度不是原因 ✓
+#   至此累计排除：我们的 split-KV 内核 / align 回存 / align precopy / 异步调度 /
+#   块表列越界 / 块表重分配 / postprocess 块大小 / 预处理列与位置 / RecoverSSM /
+#   num_accepted 快照顺序。硬结论：只在 CUDA graph 重放下（eager 48 发干净 ✓ vs 图 1-5 轮崩 ✗）。
+#   剩余嫌疑：GDN/conv 层内核、层内 mamba 状态写入（mamba_attn 侧）、reshape_and_cache、
+#   或图重放下的整体内核顺序。取证只剩两条重装备路线（cuda-gdb 附加重放 / UVA 共享内存缓冲）✗。
