@@ -110,9 +110,14 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
             self._mamba_group_ids: list[int] = []
             self._mamba_spec: MambaSpec | None = None
-            self._mamba_block_size = (
-                self.cache_config.mamba_block_size or self.cache_config.block_size
-            )
+            # Divisor for the align-mode state column. The block table this
+            # column indexes is sized from the mamba group's *resolved* spec
+            # (hybrid attention+mamba groups get aligned up to a common page),
+            # which is only known once the KV cache config exists. Requests
+            # added before that point park their resume position here and get
+            # seeded on the next preprocess_state.
+            self._mamba_block_size: int | None = None
+            self._pending_state_seed: dict[int, int] = {}
             self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
@@ -121,14 +126,27 @@ class MambaHybridModelState(DefaultModelState):
         self.num_accepted_tokens_gpu[req_index].fill_(1)
         if self._align_mode:
             # Seed the running state block from the resumed/prefilled position.
-            # The divisor must be the mamba group's block size, not the
-            # attention block size: on hybrids they differ, and a resume over a
-            # cached prefix would otherwise seed an out-of-range block_table
-            # column that the fused align pre-copy reads as a garbage block id
-            # (vllm#53142).
-            self._mamba_state_idx_gpu[req_index].fill_(
-                (new_req_data.num_computed_tokens - 1) // self._mamba_block_size
-            )
+            # The divisor must be the mamba group's *resolved* block size (the
+            # unit the block table row is indexed in), NOT cache_config.block_size:
+            # a resume over a cached prefix would otherwise compute a column up
+            # to (cache_block/group_block)x too large, and the fused align
+            # pre-copy reads that column out of the request's block-table row --
+            # a garbage block id, then a wild state address (Xid 13). The
+            # resolved size is unknown until the KV cache config exists, so a
+            # resumed request parks its position and is seeded in
+            # preprocess_state, before the advance kernel reads it back.
+            num_computed = new_req_data.num_computed_tokens
+            if num_computed > 0 and self._mamba_block_size is None:
+                self._pending_state_seed[req_index] = num_computed
+            else:
+                divisor = (
+                    self._mamba_block_size or self._mamba_block_resolved_fallback()
+                )
+                self._mamba_state_idx_gpu[req_index].fill_((num_computed - 1) // divisor)
+
+    def _mamba_block_resolved_fallback(self) -> int:
+        """Divisor used before the mamba group spec is known."""
+        return self.cache_config.mamba_block_size or self.cache_config.block_size
 
     def _get_mamba_group_info(
         self, kv_cache_config: KVCacheConfig
@@ -144,6 +162,10 @@ class MambaHybridModelState(DefaultModelState):
             ), "all mamba groups must share cache scheduling parameters"
             self._mamba_group_ids = get_mamba_group_ids(mamba_groups)
             self._mamba_spec = mamba_spec
+            # The state column indexes this group's block-table row, so its
+            # unit is the resolved spec block size -- which the KV cache
+            # coordinator may have aligned above cache_config.block_size.
+            self._mamba_block_size = int(mamba_spec.block_size)
         return self._mamba_group_ids, self._mamba_spec
 
     def _ensure_align_ctx(
@@ -209,6 +231,15 @@ class MambaHybridModelState(DefaultModelState):
         mamba_group_ids, mamba_spec = self._get_mamba_group_info(kv_cache_config)
         ctx = self._ensure_align_ctx(kv_cache_config, mamba_group_ids, block_tables)
 
+        # Apply resume positions parked by add_request before the advance
+        # kernel reads the pre-advance column back as its copy source.
+        if self._pending_state_seed:
+            for slot, num_computed in self._pending_state_seed.items():
+                self._mamba_state_idx_gpu[slot].fill_(
+                    (num_computed - 1) // self._mamba_block_size
+                )
+            self._pending_state_seed.clear()
+
         # The state-advance + pre-copy kernels run every step; they fast-exit per
         # request when src_col < 0 or src_col == dst_col, so no copy happens on
         # steps that don't cross a block boundary. (Skipping the launch entirely
@@ -227,7 +258,7 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_src_off_gpu,
             num_reqs,
             BLOCK_SIZE=block,
-            MAMBA_BLOCK_SIZE=mamba_spec.block_size,
+            MAMBA_BLOCK_SIZE=self._mamba_block_size,
         )
         ctx.run_fused_precopy(
             num_reqs,
