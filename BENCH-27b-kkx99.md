@@ -457,3 +457,15 @@
 #   质量门（90K 文档抽数字）回答正确 '172.16'；harness 167-169 tok/s 无回归。
 #   残留：该形状仍偶发（另一轮里 r1/96K 崩过，地址回到最早的 0x25e4680000，异步无栈），
 #   需在带 CUDA_LAUNCH_BLOCKING 的图模式下继续定位（或对 postprocess 侧做同样的列守卫）。
+
+# 【2026-09-13 04:5x 残留定位（第三轮）】
+#   已验证配置上复现：6 轮循环里第 4 轮 / 96K 崩（约 1 次/12-16 个长请求）。
+#   最新判据（全部热路径安全、无同步）：
+#     - 内核内 device_print：**constexpr 值能打印**（mamba_block=832 ✓ 出现 11k 行），
+#       但**张量值的 print 未落地**（n_active/pre_state_idx/num_computed/num_accepted 一行都没出 ✗）
+#       -> 下一轮要换写法（例如先 .to(tl.int32) 再逐程序打印，或把值写进 diag 缓冲再在读侧取回）。
+#     - 已排除：块表列越界 ✗（打印从未触发）、块表重分配 ✗（宿主指针不变式未触发）、
+#       postprocess 的 block_size 错误 ✗（= mamba_spec.block_size ✓ 正确）、eager 路径 ✗（干净）。
+#     - 与我们的 split-KV 内核无关 ✓（SPEC_ATTN=0 下同序列首发即崩）。
+#   【教训已固化】任何加在 preprocess_state 热路径上的 Python 侧同步都会**显著加重**该故障
+#   （实测从"12 发干净"变成"首发即崩"），相关提交已回退（db02f2db2f）。

@@ -565,6 +565,17 @@ def preprocess_mamba_align_fused_kernel(
 
     num_computed = tl.load(num_computed_tokens_ptr + req_indices, mask=mask, other=0)
     if DEBUG:
+        # Scalar summary of the first ACTIVE lane only: no per-lane flood, no host
+        # sync, and this kernel completes before the copy kernels, so the values
+        # survive a later fault inside the same CUDA-graph replay.
+        _first = tl.min(tl.where(mask, offsets, 1 << 30))
+        _sel = offsets == _first
+        tl.device_print("PRE_K n_active=", tl.sum(mask.to(tl.int32)))
+        tl.device_print("PRE_K pre_state_idx=", tl.sum(tl.where(_sel, state_idx, 0)))
+        tl.device_print("PRE_K num_computed=", tl.sum(tl.where(_sel, num_computed, 0)))
+        tl.device_print("PRE_K num_accepted=", tl.sum(tl.where(_sel, num_accepted, 0)))
+        tl.device_print("PRE_K mamba_block=", MAMBA_BLOCK_SIZE)
+    if DEBUG:
         # This kernel completes before the state-copy kernels run, so its printf is
         # flushed even when a later kernel in the same graph replay faults.
         tl.device_print("PRECOPY_K pre state_idx=", state_idx)
