@@ -8,7 +8,7 @@
 #       qwen3_5.py / qwen3_5_mtp.py  embed-quant (eq8emb checkpoints need
 #                                    quant_config on VocabParallelEmbedding)
 #       qwen3_dflash.py              vllm#51620, DFlash with a quantized drafter
-#     Plus the line's ports (#48375, #45015, marlin int8 set, csrc traps).
+#     Plus #45015, the marlin int8 set and the csrc traps (#48375 was removed here).
 #   - karl/cmp170hx-v013 (no overlay, merged in here): base
 #     lazymio/vllm-backport:latest-sm80 (v0.13.0, upstream 93911fcf68) used AS IS
 #     with a deployment-only overlay, its tree pinned by hash + text assertions.
@@ -26,18 +26,16 @@
 #     with "no parameter named 'embed_tokens.weight_packed'". The overlay is a
 #     load requirement on this box, not a preference.
 #
-# Open disagreements inherited from that line's notes -- NOT yet re-verified on
-# this tree, do not delete without checking:
-#   - vllm#48375 MambaManager extra block drop: that line deliberately does NOT
-#     apply it, because upstream get_replay_boundaries (#53945/#54713) retains the
-#     checkpoint at the post-drop candidate and the extra drop zeroed resends
-#     (a47f0f82d5). This line applies it and asserts it below. Re-verify against
-#     the v0.13.0 tree before trusting either.
-#   - #45015 PP bitmask drain: that line dropped it (the 0.13 port rewired
-#     structured output under async scheduling to a placeholder design:
-#     pending_structured_output_tokens + num_output_placeholders); this line
-#     ports the scheduler hook + engine drain and asserts them below. Re-evaluate
-#     against live traffic; the orchestrator's request-level 502 guard is the
+# Resolved 2026-09-12 (was an open disagreement between the two lines):
+#   - vllm#48375 MambaManager extra block drop: REMOVED here (the no-overlay line's
+#     position was right). Upstream get_replay_boundaries (#53945/#54713) already
+#     retains the checkpoint at the post-drop candidate; the extra drop zeroed
+#     resends, and with spec decode + CUDA graphs + a prefix-cache hit it faulted
+#     the GPU (Xid 31 MMU fault). The assertion below now requires it to be absent.
+#   - #45015 PP bitmask drain: this line keeps it (scheduler hook + engine drain,
+#     asserted below). The no-overlay line dropped it because the 0.13 port rewired
+#     structured output to a placeholder design under async scheduling; re-evaluate
+#     against live traffic -- the orchestrator's request-level 502 guard is the
 #     standing safety net.
 #
 # Only vllm/**.py is overlaid; the compiled _C.abi3.so comes from the base, so
@@ -97,12 +95,12 @@ mr = read("v1", "worker", "gpu", "model_runner.py")
 assert "tuple(bt.gpu for bt in self.block_tables.block_tables)" in mr, (
     "mamba ctx not bound to source block tables"
 )
-# vllm#48375 (unmerged): MambaManager must honour drop_eagle_block, else a
-# prefix-cache resume lands on state snapshotted over rejected draft tokens.
-# (Contested: see the header.)
+# vllm#48375's extra block drop must NOT be present (see the header: it zeroed
+# resends on this base -- with spec decode + graphs + a prefix-cache hit it faulted
+# the GPU on 2026-09-12).
 sm = read("v1", "core", "single_type_kv_cache_manager.py")
-assert "max_length = max(0, max_length - kv_cache_spec.block_size)" in sm, (
-    "MambaManager ignores drop_eagle_block"
+assert "max_length = max(0, max_length - kv_cache_spec.block_size)" not in sm, (
+    "re-ported #48375 extra block drop (mamba state zeroed on prefix-cache resends)"
 )
 # vllm#53142 (no upstream PR): state-seed divisor = mamba group block size.
 # (v0.13.0 carries the same fix as `// self._mamba_block_size`.)

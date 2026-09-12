@@ -1473,17 +1473,15 @@ class MambaManager(SingleTypeKVCacheManager):
         )
         assert dcp_world_size == 1, "DCP not support mamba now."
         assert pcp_world_size == 1, "PCP not support mamba now."
-        if drop_eagle_block:
-            # EAGLE/MTP requires dropping the final matched page of a hit: its
-            # recurrent-state snapshot may have been taken over draft tokens
-            # that verification later rejected, so resuming from it seeds the
-            # GDN/PLE state with state from a sequence that was never committed
-            # (vllm#48375, unmerged upstream). Upstream lowers max_num_blocks by
-            # one; lowering max_length by one mamba block is arithmetically
-            # identical for the coarse loop below ((x - b) // b == x // b - 1)
-            # and ALSO bounds the fine-grained partial-unit branch, which
-            # upstream's diff predates.
-            max_length = max(0, max_length - kv_cache_spec.block_size)
+        # vllm#48375 (extra block drop on an EAGLE/spec-decode prefix hit) was carried
+        # here until 2026-09-12 and is deliberately NOT applied: on this base upstream's
+        # get_replay_boundaries (#53945/#54713) already retains the checkpoint at the
+        # post-drop candidate, so the extra drop zeroed resends. Symptom of keeping it:
+        # with speculative decoding, CUDA graphs and a prefix-cache hit, the resumed
+        # mamba/GDN state pointed the verify attention outside every live buffer and
+        # faulted the GPU (Xid 31, ~1227 blocks below the KV cache base). Disabled ->
+        # the same reproducer (8-way harness + six 65k-token sends, prefix cache on)
+        # runs clean at 169 tok/s short / 62 tok/s at 134k.
         block_hashes = resolve_block_hashes(
             block_hashes,
             block_pool.hash_block_size,
