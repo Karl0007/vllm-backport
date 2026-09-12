@@ -30,7 +30,7 @@ import torch
 import triton
 import triton.language as tl
 
-NUM_SEGMENTS = 16
+NUM_SEGMENTS = 32
 BLOCK_M = 64       # query rows (q_len * G) per program at the default register budget
 BLOCK_M_BIG = 128  # ... and with 8 warps, which keeps a 16-token block in one tile
 QMAX_TOKENS = 64   # query tokens per request the caller may ask for
@@ -189,7 +189,12 @@ class SpecDecodeAttention:
         assert num_reqs <= self.max_num_reqs
         # shared memory on sm86 is 99 KB: q tile + one K and one V tile + scores must fit
         block_m, qt, ntile, warps = self._plan(max_query_len, G, D)
-        tile = 64 if (block_m <= 32 or D <= 128) else 32
+        # TILE=64 up to D=256 (measured on the 170HX at the production shape
+        # Hq=24/Hkv=4/D=256/q=8, kv=117,535, block_size=832: 0.876 ms/layer against
+        # 1.450 at TILE=32, 1.66x; tied at batch 8; 0.076 vs 0.086 ms at kv=2.3k, i.e.
+        # noise). Shared memory at BLOCK_M=64/D=256/TILE=64: q 32 KB + K 32 KB + V 32 KB
+        # + scores 16 KB = 112 KB, under sm80's 164 KB.
+        tile = 64 if (block_m <= 32 or D <= 256) else 32
         grid = (num_reqs * ntile, Hkv, self.nseg)
         _spec_attn_partial[grid](
             q, key_cache, value_cache, block_table, seqused_k, cu_seqlens_q,
