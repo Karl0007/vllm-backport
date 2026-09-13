@@ -317,7 +317,7 @@ def diag_scan(x: torch.Tensor | None, scratch: torch.Tensor, tag: int, layer: in
     _diag_scan_op(x, scratch, tag, layer, upper)
 
 
-_DIAG_PY_SLOTS = 64
+_DIAG_PY_SLOTS = 256
 
 
 def diag_py(*values: int) -> None:
@@ -433,18 +433,21 @@ def diag_call_ordinal() -> int:
     return _DIAG_CALLS_ORD
 
 
-def diag_record_call(ordinal: int, out_ptr: int, q_ptr: int, out_numel: int) -> None:
+def diag_record_call(ordinal: int, out_ptr: int, q_ptr: int, out_numel: int,
+                     layer: int = -1, num_reqs: int = -1) -> None:
     """Record one hook call's buffer identities into the py region (32 calls deep)."""
     import os
 
     if os.environ.get("VLLM_MAMBA_DIAG", "0") != "1":
         return
     buf, _stride, _has = get_diag_buffer()
-    base = int(_DIAG_PY_OFF) + 16 + (ordinal % 32) * 4
+    base = int(_DIAG_PY_OFF) + 16 + (ordinal % 30) * 8
     buf[base] = ordinal
     buf[base + 1] = out_ptr
     buf[base + 2] = q_ptr
     buf[base + 3] = out_numel
+    buf[base + 4] = layer
+    buf[base + 5] = num_reqs
 
 
 def diag_layout_selftest() -> None:

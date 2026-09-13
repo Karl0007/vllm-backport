@@ -300,7 +300,7 @@ class SpecDecodeAttention:
         return block_m, qt, triton.cdiv(q_len, qt), 8 if block_m >= 128 else 4
 
     def run(self, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table,
-            scale, num_reqs, max_query_len, k_scale=1.0, v_scale=1.0):
+            scale, num_reqs, max_query_len, k_scale=1.0, v_scale=1.0, layer_idx=-1):
         from vllm.v1.worker.mamba_utils import diag_mark, get_diag_buffer
 
         import vllm.v1.worker.mamba_utils as _mu
@@ -311,7 +311,7 @@ class SpecDecodeAttention:
         _ord = _mu.diag_call_ordinal()
         _op = out.data_ptr()
         _qp = q.data_ptr()
-        _mu.diag_record_call(_ord, _op, _qp, int(out.numel()))
+        _mu.diag_record_call(_ord, _op, _qp, int(out.numel()), layer_idx, num_reqs)
         diag_mark(out, 3000 + 4)
         import logging as _lg
 

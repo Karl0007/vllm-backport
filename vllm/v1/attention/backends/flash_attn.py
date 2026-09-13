@@ -1287,6 +1287,7 @@ class FlashAttentionImpl(AttentionImpl):
                         max_seqlen_q,
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
+                        layer_idx=getattr(layer, "diag_layer_idx", -1),
                     ):
                         return output
 
@@ -2037,7 +2038,8 @@ def _spec_attn_qmax(impl) -> int:
 
 
 def _spec_attn_run(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k,
-                   block_table, num_reqs, max_query_len, k_scale=1.0, v_scale=1.0):
+                   block_table, num_reqs, max_query_len, k_scale=1.0, v_scale=1.0,
+                   layer_idx=-1):
     """Returns True when the kernel ran, False when the batch must fall back to FA2."""
     from vllm.v1.attention.ops.spec_decode_attn import SpecDecodeAttention
 
@@ -2120,7 +2122,7 @@ def _spec_attn_run(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k
         return False
     att.run(
         q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table,
-        impl.scale, num_reqs, max_query_len, k_scale, v_scale,
+        impl.scale, num_reqs, max_query_len, k_scale, v_scale, layer_idx,
     )
     return True
 
