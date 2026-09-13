@@ -60,7 +60,7 @@ def _spec_attn_partial(
     stride_vb, stride_vs, stride_vh,
     stride_bt,
     G: tl.constexpr, Hq: tl.constexpr, QMAX: tl.constexpr, D: tl.constexpr, BLOCK_SIZE: tl.constexpr,
-    KV_FP8: tl.constexpr,
+    KV_FP8: tl.constexpr, D_KV: tl.constexpr,
     MAX_REQS: tl.constexpr,
     BLOCK_M: tl.constexpr, TILE: tl.constexpr, NSEG: tl.constexpr, QT: tl.constexpr,
     NTILE: tl.constexpr,
@@ -120,6 +120,7 @@ def _spec_attn_partial(
     row_ok = (r < QT * G) & (ri < q_len)
     q_pos = kv_len - q_len + ri                      # kv position of each query row
     d = tl.arange(0, D)
+    dkv = tl.arange(0, D_KV)   # KV head extent: bytes when the cache is fp8
     # Bound every address by construction: a captured CUDA graph replays these kernels
     # with arguments fixed at capture time, so a single stale value must not be able to
     # turn into a wild address (2026-09-12: an Xid 31 read ~4.2 GB below the KV cache).
@@ -167,8 +168,8 @@ def _spec_attn_partial(
             tl.store(diag_ptr + 7, nblocks)
         k_ok = k_ok & ~bad
         slot = pos % BLOCK_SIZE
-        k_ptrs = k_ptr + blk[:, None] * stride_kb + slot[:, None] * stride_ks + kvh * stride_kh + d[None, :]
-        v_ptrs = v_ptr + blk[:, None] * stride_vb + slot[:, None] * stride_vs + kvh * stride_vh + d[None, :]
+        k_ptrs = k_ptr + blk[:, None] * stride_kb + slot[:, None] * stride_ks + kvh * stride_kh + dkv[None, :]
+        v_ptrs = v_ptr + blk[:, None] * stride_vb + slot[:, None] * stride_vs + kvh * stride_vh + dkv[None, :]
         if KV_FP8:
             # sm80's Triton cannot load float8e4nv, so read the raw bytes and decode
             # e4m3 in software: sign(1) | exp(4) | mantissa(3), bias 7.
@@ -385,6 +386,7 @@ class SpecDecodeAttention:
             block_table.stride(0),
             G=G, Hq=Hq, QMAX=self.qmax, D=D, BLOCK_SIZE=key_cache.shape[1], BLOCK_M=block_m,
             KV_FP8=key_cache.dtype == torch.uint8,
+            D_KV=(D * 2 if key_cache.dtype == torch.uint8 else D),
             MAX_REQS=self.max_num_reqs,
             TILE=tile, NSEG=self.nseg, QT=qt, NTILE=ntile,
             num_warps=warps, num_stages=1,
