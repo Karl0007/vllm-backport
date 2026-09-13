@@ -453,16 +453,16 @@ class Qwen3NextAttention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         _li = self.diag_layer_idx
-        diag_mark(hidden_states, 1000 + _li * 8 + 0)
+        diag_mark(hidden_states, 1000 + _li * 8 + 0, _li)
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, gate = self._project_qkv_gate(qkv, positions)
-        diag_mark(q, 1000 + _li * 8 + 1)
+        diag_mark(q, 1000 + _li * 8 + 1, _li)
         attn_output = self.attn(q, k, v)
-        diag_mark(attn_output, 1000 + _li * 8 + 2)
+        diag_mark(attn_output, 1000 + _li * 8 + 2, _li)
         if gate is not None:
             attn_output = attn_output * torch.sigmoid(gate)
         output, _ = self.o_proj(attn_output)
-        diag_mark(output, 1000 + _li * 8 + 3)
+        diag_mark(output, 1000 + _li * 8 + 3, _li)
         return output
 
 
@@ -561,7 +561,7 @@ class Qwen3NextDecoderLayer(nn.Module):
     ):
         full_num_tokens = positions.shape[-1]
 
-        diag_mark(hidden_states, self.layer_idx * 4 + 0)
+        diag_mark(hidden_states, self.layer_idx * 4 + 0, self.layer_idx)
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -582,7 +582,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             raise ValueError("Invalid layer_type")
 
-        diag_mark(hidden_states, self.layer_idx * 4 + 1)
+        diag_mark(hidden_states, self.layer_idx * 4 + 1, self.layer_idx)
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
                 hidden_states = hidden_states * (
@@ -611,7 +611,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             hidden_states = self.mlp(hidden_states)
 
-        diag_mark(hidden_states, self.layer_idx * 4 + 2)
+        diag_mark(hidden_states, self.layer_idx * 4 + 2, self.layer_idx)
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
                 hidden_states = hidden_states * (

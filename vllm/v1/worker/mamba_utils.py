@@ -202,6 +202,8 @@ _DIAG_PROD_OFF = tl.constexpr(_DIAG_SLOTS)
 _DIAG_PROD_STRIDE = tl.constexpr(64)
 _DIAG_PROG_OFF: tl.constexpr = 2 * _DIAG_SLOTS
 _DIAG_MARK_COUNT_OFF: tl.constexpr = 2 * _DIAG_SLOTS + 1
+_DIAG_LAYER_OFF: tl.constexpr = 2 * _DIAG_SLOTS + 2
+_DIAG_LAYER_N: tl.constexpr = 128
 # Scan region: 8 programs x 8 slots (8192 tokens / 1024).
 _DIAG_SCAN_OFF: tl.constexpr = 2 * _DIAG_SLOTS + 8
 _DIAG_SCAN_PROGS: tl.constexpr = 8
@@ -231,29 +233,34 @@ def get_diag_buffer():
 
 
 @triton.jit
-def _diag_mark_kernel(ptr, value, x, counter_ptr):
+def _diag_mark_kernel(ptr, value, x, counter_ptr, layer_ptr, layer):
     # Also rewrites x[0] with its own value: a declared in-place write keeps the
     # compiler from deleting the marker, and the value is unchanged. The counter
     # counts executed markers: during a CUDA-graph replay no Python runs, so this
     # is the only way to tell how far the replay got.
     tl.store(ptr, value)
     tl.store(counter_ptr, tl.load(counter_ptr) + 1)
+    if layer >= 0:
+        # Per-layer progress: which layers completed tells a post-mortem how far a
+        # graph replay got (no Python runs there).
+        tl.store(layer_ptr + layer, value)
     tl.store(x, tl.load(x))
 
 
 @torch.library.custom_op("vllm::diag_mark", mutates_args={"x"})
-def _diag_mark_op(x: torch.Tensor, value: int) -> None:
+def _diag_mark_op(x: torch.Tensor, value: int, layer: int = -1) -> None:
     # Body runs eagerly at runtime; the env check and the buffer creation live
     # here so the caller stays traceable inside a compiled / captured forward.
     import os
 
     if os.environ.get("VLLM_MAMBA_DIAG", "0") == "1":
         buf, _stride, _has = get_diag_buffer()
-        _diag_mark_kernel[(1,)](buf[_DIAG_PROG_OFF:], value, x, buf[_DIAG_MARK_COUNT_OFF:])
+        _diag_mark_kernel[(1,)](buf[_DIAG_PROG_OFF:], value, x,
+                                buf[_DIAG_MARK_COUNT_OFF:], buf[_DIAG_LAYER_OFF:], layer)
 
 
 @_diag_mark_op.register_fake
-def _diag_mark_fake(x: torch.Tensor, value: int) -> None:
+def _diag_mark_fake(x: torch.Tensor, value: int, layer: int = -1) -> None:
     return None
 
 
@@ -391,7 +398,7 @@ def diag_dump(x: torch.Tensor | None, scratch: torch.Tensor, slot: int) -> None:
     _diag_dump_op(x, scratch, slot)
 
 
-def diag_mark(x: torch.Tensor, value: int) -> None:
+def diag_mark(x: torch.Tensor, value: int, layer: int = -1) -> None:
     """Per-layer progress marker (diagnostic only; identity unless VLLM_MAMBA_DIAG=1).
 
     One thread, one store into host-mapped memory: the last value left in the
@@ -399,7 +406,7 @@ def diag_mark(x: torch.Tensor, value: int) -> None:
     the CUDA graph, so replays write them too. Returns its input unchanged; the
     declared in-place write keeps the compiler from deleting the marker.
     """
-    _diag_mark_op(x, value)
+    _diag_mark_op(x, value, layer)
 
 
 def open_diag_buffer():
@@ -417,7 +424,7 @@ def open_diag_buffer():
 
     import torch
 
-    size = (2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16 + _DIAG_PY_SLOTS + 512 * 16 + 1 + 4 * 512) * 8
+    size = (2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16 + _DIAG_PY_SLOTS + 512 * 16 + 1 + 4 * 512 + 128) * 8
     if not os.path.exists(_DIAG_PATH):
         with open(_DIAG_PATH, "wb") as f:
             f.write(b"\0" * size)
@@ -427,7 +434,7 @@ def open_diag_buffer():
     err = torch.cuda.cudart().cudaHostRegister(int(addr), size, 2)  # Mapped
     if int(err) != 0:
         raise RuntimeError(f"cudaHostRegister failed: {err}")
-    out = torch.frombuffer(buf, dtype=torch.int64, count=2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16 + _DIAG_PY_SLOTS + 512 * 16 + 1 + 4 * 512)
+    out = torch.frombuffer(buf, dtype=torch.int64, count=2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16 + _DIAG_PY_SLOTS + 512 * 16 + 1 + 4 * 512 + 128)
     out.fill_(-1)
     return out
 
