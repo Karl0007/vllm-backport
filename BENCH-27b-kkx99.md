@@ -825,3 +825,25 @@
 # 修法方向 ✓：让二者口径一致（把 draft token 计入 query_start_loc ✗，或让 FlashInfer
 #   只消费 verify 段 ✗）—— 修好后 `fp8 + 投机` 可跑 ✓，速度拿回 15~25% ✓
 #   （容量仍 603K ✗ —— 投机预留 speculative blocks 属设计 ✓）。
+
+# 【2026-09-13 ★★★交付：fp8 KV 上线生产（容量 +36%，崩溃路径消除，已验收）】
+#
+# 根因修复（上游级 ✓）：FlashInfer 后端的 q / qo_indptr 口径不一致 ✗
+#   runner 为 CUDA graph 填充 `num_actual_tokens` ✗ -> query 张量比 paged plan
+#   （由 query_start_loc 构建）覆盖的 token 多 ✗ -> FlashInfer 校验后拒绝 ✗
+#   修复：builder 记录**真实（未填充）token 数**（取自 query_start_loc 末值 ✓），
+#        forward 按它同时切片 prefill 的 **query 与 out** ✗
+#        （填充行槽位为 -1 ✓，丢弃它们与其它后端的行为一致 ✓）
+#   文件：vllm/v1/attention/backends/flashinfer.py（+ 已加入挂载清单 ✓）
+#
+# 生产切换（orchestrator worker 配置 ✓）：`KV_DTYPE: 'fp8'` ✓
+#   验收（生产端口 18000 ✓，与旧配置同一 harness ✓）：
+#     容量     442,106 -> **603,522 tokens（+36%）** ✓✓
+#     速度     2.4K 81.1 / 54K 68.3 / **126K 55.8 tok/s** ✓✓（旧 50~58 ✓ = 无损 ✓）
+#     稳定性   **24 发全过** ✓✓（测试实例另 96 发 ✓ -> 累计 120 发 ✓✓；旧配置每 3~16 崩 ✗）
+#     质量     needle 307K 字符命中 ✓✓
+#     功能     投机 ✓ 前缀缓存 ✓ 长上下文 ✓ 图 ✓（仅关掉 split-KV 钩子 ✗ = 纯速度特性 ✓）
+#
+# 与崩溃的关系（诚实记录 ✗）：**崩溃路径被消除** ✓（fp8 使钩子的 gate 不成立 ✓），
+#   但**底层 bug 仍未修复** ✗（未定位到具体内核 ✗）—— 若将来重新启用钩子/bf16 KV，
+#   该故障会回来 ✗。见上方"地址级分析"与"全量排除清单" ✓。
