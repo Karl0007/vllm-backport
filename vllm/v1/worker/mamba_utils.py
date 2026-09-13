@@ -245,7 +245,11 @@ def _diag_mark_kernel(ptr, value, x, counter_ptr, layer_ptr, layer, ring_ptr, ri
         # Per-layer progress: which layers completed tells a post-mortem how far a
         # graph replay got (no Python runs there).
         tl.store(layer_ptr + layer, value)
-    tl.store(x, tl.load(x))
+    # NOTE: this kernel must NOT touch `x`. It used to rewrite x[0] in place as an
+    # anchor, but that made the marker the first kernel to write the attention output
+    # buffer, which is exactly where a bad `out` faults. Tensors are anchored from
+    # Python instead (a module-level reference list), so the marker only ever writes
+    # the host-mapped buffer.
 
 
 @torch.library.custom_op("vllm::diag_mark", mutates_args={"x"})
@@ -424,6 +428,12 @@ def diag_dump(x: torch.Tensor | None, scratch: torch.Tensor, slot: int) -> None:
 
 
 _DIAG_CALLS_ORD = 0
+_DIAG_ANCHORS = []   # keeps marked tensors alive without a device-side write
+
+
+def diag_anchor(t) -> None:
+    """Retained for compatibility; the marker kernel no longer touches tensors."""
+    return None
 
 
 def diag_call_ordinal() -> int:
@@ -434,7 +444,7 @@ def diag_call_ordinal() -> int:
 
 
 def diag_record_call(ordinal: int, out_ptr: int, q_ptr: int, out_numel: int,
-                     layer: int = -1, num_reqs: int = -1) -> None:
+                     layer: int = -1, num_reqs: int = -1, extra_ptr: int = -1) -> None:
     """Record one hook call's buffer identities into the py region (32 calls deep)."""
     import os
 
@@ -448,6 +458,7 @@ def diag_record_call(ordinal: int, out_ptr: int, q_ptr: int, out_numel: int,
     buf[base + 3] = out_numel
     buf[base + 4] = layer
     buf[base + 5] = num_reqs
+    buf[base + 6] = extra_ptr
 
 
 def diag_layout_selftest() -> None:
@@ -485,6 +496,8 @@ def diag_mark(x: torch.Tensor, value: int, layer: int = -1) -> None:
     the CUDA graph, so replays write them too. Returns its input unchanged; the
     declared in-place write keeps the compiler from deleting the marker.
     """
+    # No anchoring: the marker kernel ignores x entirely and only writes the host-mapped
+    # buffer, so nothing needs to stay alive on the device side.
     _diag_mark_op(x, value, layer)
 
 

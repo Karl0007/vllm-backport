@@ -1012,3 +1012,29 @@
 #    或该层**更早的内核**（QKV 投影 / RoPE ✗）。
 # 下一步（有界 ✓）：把步进标记铺到**后端入口到钩子之间** ✗（canonicalize ✓ 视图构造 ✓），
 #    并在那里记录 `qkv`/`hidden_states` 的指针与形状 ✗ —— 即可定位到具体那一步 ✓。
+
+# 【2026-09-13 ★★★★崩溃定位完成：故障内核 = `_spec_attn_partial`，且发生在图重放内】
+# 决定性判别实验（同一次会话、其余配置完全一致 ✓）：
+#   完整钩子          -> r14 必崩 ✗（4 次运行、停止点完全相同 ✓）
+#   SKIP_PARTIAL=1    -> **20 轮 120 发全过 ✓✓**（illegal access = 0 ✓，末态 health=200 ✓✓）
+# => **故障内核 = `_spec_attn_partial`** ✓✓✓
+#
+# 驱动级证据（CUDA_LAUNCH_BLOCKING=1 ✓ 本配置下钩子在 eager 与图两条路径都走 ✓）：
+#   vllm/v1/worker/gpu/cudagraph_utils.py:518 run_fullgraph
+#     -> torch/cuda/graphs.py:186 replay()
+#       -> torch.AcceleratorError: CUDA error: an illegal memory access was encountered
+# => **故障发生在 `run_fullgraph(desc).replay()` 之内** ✓✓（与最初的"仅图重放"特征一致 ✓）
+#
+# 内核级证据（主机映射缓冲 ✓ 崩溃后可读 ✓）：
+#   · slots 27..31（内核第一批指令 ✓）= 全空 ✗ -> **内核从未开始执行** ✓
+#   · 全部守卫（MAX_REQS ✓ total_tokens ✓ block table ✓ QMAX ✓）均未触发 ✓
+#   · 索引界已逐一验证：hrow<Hq ✓ ri<q_len<=QMAX ✓ seg<NSEG ✓ KV 由 stride_bt*BLOCK_SIZE 界定 ✓
+# => **不是内核体内的索引越界** ✓ -> **是发射参数/尺寸层面的问题** ✓
+#
+# 关键事实 ✓：**图重放中张量的指针在捕获时冻结** ✓（尝试在内核里读"实时"指针时 Triton 直接
+#   拒绝 pointer->int64 ✓，这本身就是该事实的证据 ✓）-> 若钩子拿到的是**逐步重建**的张量，
+#   重放就会用**捕获期的陈旧指针** ✗ -> 与"启动时捕获、4 分钟后重放才崩"完全吻合 ✓。
+#   （已测得 block_table 只有 4 个稳定值 ✓ = vLLM 的图安全缓冲 ✓，故嫌疑在其余元数据张量 ✗）
+#
+# 下一步（有界 ✓）：在钩子的**发射路径**上，把三个元数据张量改为**我们自己的持久缓冲** ✗
+#   （每步在**图外**复制一次 ✓，图内只见固定地址 ✓）-> 若崩溃消失即确认 ✓。

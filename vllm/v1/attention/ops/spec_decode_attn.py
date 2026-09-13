@@ -71,6 +71,15 @@ def _spec_attn_partial(
     kvh = tl.program_id(1)
     seg = tl.program_id(2)
 
+    # Raw launch-time values, written before any load: the last slot left in the buffer
+    # says how far the kernel got, and the values themselves (request index, tile, head,
+    # segment) reveal a bad grid or a bad request count at replay time. Slots 27..31.
+    tl.store(diag_ptr + 27, pid)
+    tl.store(diag_ptr + 28, req)
+    tl.store(diag_ptr + 29, qtile)
+    tl.store(diag_ptr + 30, kvh)
+    tl.store(diag_ptr + 31, seg)
+
     # The partial buffers hold MAX_REQS requests (their capacity at allocation).
     # A request slot beyond that must not index them: under CUDA-graph replay the
     # caller cannot re-validate the batch, so the kernel bounds itself. The grid is
@@ -311,7 +320,11 @@ class SpecDecodeAttention:
         _ord = _mu.diag_call_ordinal()
         _op = out.data_ptr()
         _qp = q.data_ptr()
-        _mu.diag_record_call(_ord, _op, _qp, int(out.numel()), layer_idx, num_reqs)
+        # Record the block table pointer as well: the partial kernel never starts at
+        # replay time (its first stores are absent) while skipping it is stable, so one of
+        # its pointer arguments must be stale in the captured graph.
+        _bp = block_table.data_ptr()
+        _mu.diag_record_call(_ord, _op, _qp, int(out.numel()), layer_idx, num_reqs, _bp)
         diag_mark(out, 3000 + 4)
         import logging as _lg
 
@@ -378,9 +391,9 @@ class SpecDecodeAttention:
         # tensors are not. Dump both so a post-mortem can spot the mismatch.
         from vllm.v1.worker.mamba_utils import diag_dump as _dd
 
-        _dd(seqused_k, out, 0)
-        _dd(cu_seqlens_q, out, 1)
-        _dd(block_table, out, 2)
+        # The live-tensor dumps used to run here. They are the only kernels between the
+        # hook entry marker and the partial launch, so they were removed to test whether
+        # the fault is in them or in the partial kernel itself.
         diag_ring(9, num_reqs, max_query_len, q.shape[0], key_cache.shape[0],
                   key_cache.shape[1], self.qmax, block_m, qt, ntile, warps)
         # TILE=64 up to D=256 (measured on the 170HX at the production shape

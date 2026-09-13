@@ -455,7 +455,9 @@ class Qwen3NextAttention(nn.Module):
         _li = self.diag_layer_idx
         diag_mark(hidden_states, 1000 + _li * 8 + 0, _li)
         qkv, _ = self.qkv_proj(hidden_states)
+        diag_mark(qkv, 1000 + _li * 8 + 4)   # QKV 投影完成（下一段是 RoPE/切分）
         q, k, v, gate = self._project_qkv_gate(qkv, positions)
+        diag_mark(q, 1000 + _li * 8 + 5)     # RoPE/切分完成（下一段是注意力后端）
         diag_mark(q, 1000 + _li * 8 + 1, _li)
         attn_output = self.attn(q, k, v)
         diag_mark(attn_output, 1000 + _li * 8 + 2, _li)
