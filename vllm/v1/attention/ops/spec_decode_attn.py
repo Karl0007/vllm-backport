@@ -178,9 +178,10 @@ def _spec_attn_partial(
             k = (_e4m3_to_fp32(kb) * k_scale).to(tl.bfloat16)
             v = (_e4m3_to_fp32(vb) * v_scale).to(tl.bfloat16)
         else:
-            # fp8/int8 stores x / scale, so multiply back (scale is 1.0 for bf16).
-            k = tl.load(k_ptrs, mask=k_ok[:, None], other=0.0).to(tl.float32) * k_scale
-            v = tl.load(v_ptrs, mask=k_ok[:, None], other=0.0).to(tl.float32) * v_scale
+            # Unquantized cache: load verbatim (no conversion) so the bf16 fast path is
+            # byte-for-byte what it was before the fp8 support was added.
+            k = tl.load(k_ptrs, mask=k_ok[:, None], other=0.0)
+            v = tl.load(v_ptrs, mask=k_ok[:, None], other=0.0)
         s = tl.dot(qs, tl.trans(k)).to(tl.float32)            # [BLOCK_M, TILE]
         allowed = k_ok[None, :] & (pos[None, :] <= q_pos[:, None]) & row_ok[:, None]
         s = tl.where(allowed, s, float("-inf"))
