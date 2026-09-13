@@ -924,3 +924,17 @@
 #   （参考）bf16 无钩子     ✗ : 2.4K 105.0 / 126K **19.7** ✗✗
 # => 取舍实为：**短上下文 -26% ✗ 换 长上下文 +33% ✓✓ + 容量 +36% ✓✓ + 稳定 ✓✓**
 # 钩子的 fp8 化（两全）仍在开关后待修 ✗（字节视图语义 ✗）；但按上述数字，优先级可降 ✓。
+
+# 【2026-09-13 cuda-gdb 通道打通 ✓（但未停在设备异常 ✗）】
+# 已打通 ✓：宿主 cuda-gdb 12.8 挂进容器 ✓（-v /usr/local/cuda ✓ + SYS_PTRACE ✓ +
+#   包装脚本用镜像真实 entrypoint `python3 /usr/local/bin/vllm serve` ✓）
+#   -> **引擎能在 gdb 下正常启动 ✓**（就绪 250 s ✓），复现也**能在 gdb 下崩** ✓
+# 未达成 ✗：gdb **没有停在设备端异常上** ✗（日志里只有 torch 报的 sticky error ✓ + 主机栈 ✗）
+#   -> `--batch -ex run` 不足以捕获 CUDA 异常 ✓；`set cuda memcheck on` 也未产出报告 ✗
+# 下次的精确做法 ✓：
+#   ① 用 `-ex "set cuda api_failures stop"` + `-ex "set cuda memcheck on"` **并确认其生效** ✓
+#      （本次未验证是否启用成功 ✗ —— 应先 `-ex "show cuda memcheck"` 打印状态 ✓）
+#   ② 或改为 **attach 方式** ✗：先常驻启动（`VLLM_GDB` 不带 run ✗），跑起复现后再
+#      `cuda-gdb -p <engine_pid>` 附加 ✓✓ —— 对"图重放中的偶发故障"更稳 ✓
+#   ③ 或 `-ex "handle SIGSEGV stop"` + `-ex continue` ✗
+# 影响面 ✓：崩溃**影响已消除** ✓✓（fp8 路径不触发 ✓，168+ 发全过 ✓）—— 以上纯属追根因 ✗。
