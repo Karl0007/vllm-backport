@@ -755,3 +755,16 @@
 #    修法：让 warmup 混合批的 `query_start_loc` 覆盖全部请求 ✗（或按量化 KV+投机跳过该步 ✗）
 #    已加 env 门控的跳过开关（`VLLM_SKIP_MIXED_WARMUP=1` ✗）但**未命中真正的调用点** ✗
 #    （栈指向 `_warmup_kernels` 内部 ✗，需下一轮精确定位 ✓）
+
+# 【2026-09-13 ★★fp8 容量可达（+36% ✓），但投机下无法服务（同一处元数据错配 ✗）】
+# 跳过 warmup（`VLLM_SKIP_WARMUP=1` ✗ —— 只是预编译 ✓）后：
+#   **实例成功启动** ✓ health=200 ✓
+#   **KV 容量 442,106 -> 603,522 tokens** ✓✓（**+36%** ✓；非 ×2 ✗ 因注意力 KV 只占池一部分 ✓）
+# 但**第一个真实请求即死于同一处错配** ✗：
+#   flashinfer/prefill.py:2825 run -> ValueError: q.shape[0] (16) does not match qo_indptr[-1] (8)
+#   => 该不兼容**不止在 warmup** ✗ —— **真实服务路径同样触发** ✓（此前"仅 warmup"的结论已修正 ✗）
+# 特征：单请求、8 token（1+7 投机 ✓）却 q=16 ✗ = **2 × 8** ✗
+#   -> query 的 token 数是 qo_indptr 的两倍 ✗（投机 token 被重复计入 ✗）
+# => 修复目标**明确且有限** ✓：flashinfer 后端的 spec-decode 元数据构造 ✗
+#    （`qo_indptr`/`q` 的 token 数必须一致 ✓）
+# 备选（不可接受 ✗）：关投机可绕开 ✗ —— 但那是**功能回退** ✗（用户明确不接受 ✗）
