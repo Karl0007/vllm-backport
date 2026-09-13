@@ -40,7 +40,6 @@ PATCHES.update({
     "reject_sampler.py": "v1/sample/rejection_sampler.py",
     "warmup.py": "v1/worker/gpu/warmup.py",
     "qwen_dflash.py": "model_executor/models/qwen3_dflash.py",
-    "qwen_gdn_attn.py": "model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
     "qwen3_5.py": "model_executor/models/qwen3_5.py",
     "qwen3_5_mtp.py": "model_executor/models/qwen3_5_mtp.py",
 })
@@ -98,18 +97,48 @@ REQUIRED = (
     ),
     (
         "v1/engine/core.py",
-        "SchedulerOutput",
+        "def _merge_engine_core_outputs(",
         "engine core wiring for the split-KV port missing",
     ),
     (
         "v1/sample/rejection_sampler.py",
-        "num_draft_tokens",
-        "rejection sampler wiring for the split-KV port missing",
+        "if num_draft_tokens < 0 or num_draft_tokens > max_spec_len:",
+        "rejection sampler lost its spec-decode bounds path",
     ),
     (
         "v1/worker/gpu/spec_decode/eagle/utils.py",
-        "PPMissingLayer",
+        "_EMBED_KEYS = (",
         "draft embed lookup aliases a missing layer instead of skipping it",
+    ),
+    (
+        "v1/core/sched/interface.py",
+        "def has_structured_output_in_flight(",
+        "scheduler interface hook for the split-KV port missing",
+    ),
+    (
+        "v1/core/sched/scheduler.py",
+        "def has_structured_output_in_flight(",
+        "scheduler implementation of the split-KV in-flight hook missing",
+    ),
+    (
+        "v1/worker/gpu/warmup.py",
+        "VLLM_SKIP_WARMUP",
+        "warmup switch for quantized KV + speculation gone (or renamed)",
+    ),
+    (
+        "model_executor/models/qwen3_dflash.py",
+        "def _can_fuse_context_kv(",
+        "DFlash context-KV fusion entry point missing",
+    ),
+    (
+        "model_executor/models/qwen3_5.py",
+        'prefix=maybe_prefix(prefix, "embed_tokens"),',
+        "Qwen3.5 embed_tokens prefix fix missing (draft embed aliasing)",
+    ),
+    (
+        "model_executor/models/qwen3_5_mtp.py",
+        'prefix=maybe_prefix(prefix, "embed_tokens"),',
+        "Qwen3.5-MTP embed_tokens prefix fix missing (draft embed aliasing)",
     ),
 )
 

@@ -209,7 +209,44 @@ require(
 )
 
 eagle = read("v1", "worker", "gpu", "spec_decode", "eagle", "utils.py")
-require(eagle, "PPMissingLayer", "draft embed lookup aliases a missing layer again")
+require(eagle, "_EMBED_KEYS = (", "draft embed lookup aliases a missing layer again")
 
 rs = read("v1", "sample", "rejection_sampler.py")
-require(rs, "num_draft_tokens", "rejection sampler lost its spec-decode path")
+require(
+    rs,
+    "if num_draft_tokens < 0 or num_draft_tokens > max_spec_len:",
+    "rejection sampler lost its spec-decode bounds path",
+)
+
+require(
+    read("v1", "engine", "core.py"),
+    "def _merge_engine_core_outputs(",
+    "engine core wiring for the split-KV port missing",
+)
+require(
+    read("v1", "core", "sched", "interface.py"),
+    "def has_structured_output_in_flight(",
+    "scheduler interface hook for the split-KV port missing",
+)
+sched_scheduler = read("v1", "core", "sched", "scheduler.py")
+require(
+    sched_scheduler,
+    "def has_structured_output_in_flight(",
+    "scheduler implementation of the split-KV in-flight hook missing",
+)
+require(
+    read("v1", "worker", "gpu", "warmup.py"),
+    "VLLM_SKIP_WARMUP",
+    "warmup switch for quantized KV + speculation gone (or renamed)",
+)
+require(
+    read("model_executor", "models", "qwen3_dflash.py"),
+    "def _can_fuse_context_kv(",
+    "DFlash context-KV fusion entry point missing",
+)
+for _qwen35 in ("qwen3_5.py", "qwen3_5_mtp.py"):
+    require(
+        read("model_executor", "models", _qwen35),
+        'prefix=maybe_prefix(prefix, "embed_tokens"),',
+        f"{_qwen35}: embed_tokens prefix fix missing (draft embed aliasing)",
+    )

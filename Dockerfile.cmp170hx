@@ -41,6 +41,14 @@
 #                                    backend (default "0"; profile sets SPEC_ATTN=1)
 #   - VLLM_SPEC_DECODE_ATTN_QMAX=N   cap query tokens per request (default 0 = derive
 #                                    from the model's spec config)
+#   - VLLM_SKIP_MIXED_WARMUP=1       skip the mixed prefill+decode warmup step
+#   - VLLM_SKIP_WARMUP=1             skip the warmup entirely
+#     (both default "0" = unchanged behaviour; they exist because a quantized KV
+#      cache plus speculation routes the warmup through FlashInfer's paged-prefill
+#      API with a query covering two requests while qo_indptr covers one --
+#      'q.shape[0] (16) does not match qo_indptr[-1] (8)'. On this host DSV4 is the
+#      only profile with fp8 KV + speculation, so if that startup error ever shows
+#      up again, these two switches are the first thing to try.)
 #   Cost note: the split-KV hook is +12% decode on the FA2 path (117.5 vs 105.0
 #   aggregate, decode3). The short-context -26% seen on x99 comes from the fp8 KV
 #   profile switching the backend to FlashInfer (97.6), NOT from this hook.
@@ -133,7 +141,6 @@ COPY vllm/v1/worker/gpu/spec_decode/eagle/utils.py /tmp/vllm_patch/eagle_utils.p
 COPY vllm/v1/sample/rejection_sampler.py /tmp/vllm_patch/reject_sampler.py
 COPY vllm/v1/worker/gpu/warmup.py /tmp/vllm_patch/warmup.py
 COPY vllm/model_executor/models/qwen3_dflash.py /tmp/vllm_patch/qwen_dflash.py
-COPY vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py /tmp/vllm_patch/qwen_gdn_attn.py
 COPY vllm/model_executor/models/qwen3_5.py /tmp/vllm_patch/qwen3_5.py
 COPY vllm/model_executor/models/qwen3_5_mtp.py /tmp/vllm_patch/qwen3_5_mtp.py
 COPY deploy/apply-vllm-patches.py /tmp/vllm_patch/apply-vllm-patches.py
