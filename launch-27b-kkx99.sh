@@ -122,7 +122,7 @@ mkdir -p "$CACHE_DIR/vllm" "$CACHE_DIR/triton" "$CACHE_DIR/inductor"
 
 sudo docker run --rm \
   --name "$NAME" \
-  ${VLLM_GDB:+--cap-add=SYS_PTRACE -v /usr/local/cuda:/usr/local/cuda:ro -v "$HERE/gdb-wrap.sh:/gdb-wrap.sh:ro"} \
+  ${VLLM_GDB_MOUNT:+--cap-add=SYS_PTRACE -v /usr/local/cuda:/usr/local/cuda:ro -v "$HERE/gdb-wrap.sh:/gdb-wrap.sh:ro" -v "$HERE/gdb-attach.sh:/gdb-attach.sh:ro"} \
   --gpus "device=$GPU_ID" \
   --ipc=host \
   --shm-size=4g \

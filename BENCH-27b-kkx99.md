@@ -938,3 +938,19 @@
 #      `cuda-gdb -p <engine_pid>` 附加 ✓✓ —— 对"图重放中的偶发故障"更稳 ✓
 #   ③ 或 `-ex "handle SIGSEGV stop"` + `-ex continue` ✗
 # 影响面 ✓：崩溃**影响已消除** ✓✓（fp8 路径不触发 ✓，168+ 发全过 ✓）—— 以上纯属追根因 ✗。
+
+# 【2026-09-13 ★归属路径终点（硬结论 ✓）：cuda-gdb 无法做设备级归属 ✗】
+# 已把 cuda-gdb 通道做到极限 ✓：
+#   ① attach 到 EngineCore（pid ✓）成功 ✓，`--batch -ex continue` 生效 ✓
+#   ② `set cuda api_failures stop` -> 停在 **API 级**（cudaEventSynchronize 返回
+#      cudaErrorIllegalAddress ✓）—— 拿不到内核名 ✗
+#   ③ `set cuda api_failures ignore` -> 让**设备陷阱**停它 ✗ -> 进程直接 **SIGABRT** ✓
+#      且 gdb 报 **"No CUDA kernels"** ✗
+#   ④ cuda-gdb 12.8 **已移除 CUDA Memory Checker** ✗（提示改用独立 Compute Sanitizer ✓）
+# => 硬结论 ✓：**该故障是异步 MMU 故障** ✓（内核早已结束 ✗，sticky error 只在后续
+#    API 处浮现 ✓），**cuda-gdb 只能停在主机 API 层** ✗；而 Compute Sanitizer
+#    **无法装入镜像** ✗（无网络 ✓）。
+# => 唯一剩下的归属手段 ✓：**在宿主侧跑一次带 compute-sanitizer 的 vLLM** ✗
+#    （需宿主安装 vLLM ✗）或**自建含 Compute Sanitizer 的派生镜像** ✗（宿主有网络 ✓）。
+# 备选 ✓：给每个可疑内核**无条件写"执行到此处"到主机映射缓冲** ✗（本会话已具备该能力 ✓，
+#    即 diag_mark ✓ —— 把它铺到 hook 的每个内核入口/出口即可等价于"内核级横切"✗）。
