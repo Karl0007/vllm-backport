@@ -63,7 +63,7 @@ def _spec_attn_partial(
     KV_FP8: tl.constexpr, D_KV: tl.constexpr,
     MAX_REQS: tl.constexpr,
     BLOCK_M: tl.constexpr, TILE: tl.constexpr, NSEG: tl.constexpr, QT: tl.constexpr,
-    NTILE: tl.constexpr,
+    NTILE: tl.constexpr, NO_KV: tl.constexpr,
 ):
     pid = tl.program_id(0)
     req = pid // NTILE
@@ -152,8 +152,13 @@ def _spec_attn_partial(
     q_ptrs = q_ptr + q_row[:, None] * stride_qt + (kvh * G + rg)[:, None] * stride_qh + d[None, :]
     q = tl.load(q_ptrs, mask=row_ok[:, None], other=0.0)
 
-    # this segment's key range
-    tiles_total = (kv_len + TILE - 1) // TILE
+    # Diagnostic bisect: with the KV tiles forced to zero the gather never runs, which
+    # separates the KV cache reads from the rest of the kernel. Partials written this way
+    # are meaningless (the results are wrong); this is not a production switch.
+    if NO_KV:
+        tiles_total = 0
+    else:
+        tiles_total = (kv_len + TILE - 1) // TILE
     tiles_per_seg = (tiles_total + NSEG - 1) // NSEG
     t0 = seg * tiles_per_seg
     t1 = tl.minimum(t0 + tiles_per_seg, tiles_total)
@@ -186,6 +191,19 @@ def _spec_attn_partial(
             tl.store(diag_ptr + 7, nblocks)
         k_ok = k_ok & ~bad
         slot = pos % BLOCK_SIZE
+        # Every address component of the gather, written unconditionally: the fault is
+        # inside this gather (skipping it is stable, running it crashes) and the block-id
+        # guard never fires, so one of the strides or extents must be the wild one.
+        tl.store(diag_ptr + 50, tl.max(blk))
+        tl.store(diag_ptr + 51, tl.max(slot))
+        tl.store(diag_ptr + 52, stride_kb)
+        tl.store(diag_ptr + 53, stride_ks)
+        tl.store(diag_ptr + 54, BLOCK_SIZE)
+        tl.store(diag_ptr + 55, nblocks)
+        tl.store(diag_ptr + 56, kv_len)
+        tl.store(diag_ptr + 57, tl.max(k_ptrs.to(tl.int64, bitcast=False) - k_ptr) if False else D_KV)
+        tl.store(diag_ptr + 58, stride_kh)
+        tl.store(diag_ptr + 59, kvh)
         k_ptrs = k_ptr + blk[:, None] * stride_kb + slot[:, None] * stride_ks + kvh * stride_kh + dkv[None, :]
         v_ptrs = v_ptr + blk[:, None] * stride_vb + slot[:, None] * stride_vs + kvh * stride_vh + dkv[None, :]
         if KV_FP8:
@@ -424,6 +442,7 @@ class SpecDecodeAttention:
             KV_FP8=key_cache.dtype == torch.uint8,
             D_KV=(D * 2 if key_cache.dtype == torch.uint8 else D),
             MAX_REQS=self.max_num_reqs,
+        NO_KV=_os.environ.get("VLLM_SPEC_ATTN_NO_KV", "0") == "1",
             TILE=tile, NSEG=self.nseg, QT=qt, NTILE=ntile,
             num_warps=warps, num_stages=1,
         )
