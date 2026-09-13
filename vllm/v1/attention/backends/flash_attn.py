@@ -10,6 +10,8 @@ from typing import ClassVar
 import numpy as np
 import torch
 
+from vllm.v1.worker.mamba_utils import diag_mark, diag_py, diag_ring, diag_scan
+
 from vllm.model_executor.layers.attention import Attention
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import (
@@ -1017,6 +1019,44 @@ class FlashAttentionImpl(AttentionImpl):
         # performance to make sure it does not introduce any overhead.
 
         num_actual_tokens = attn_metadata.num_actual_tokens
+        # Diagnostic: flag negative metadata entries (slot_mapping / block_table)
+        # at the attention entry; the last marker before a crash brackets the
+        # faulting call.
+        diag_scan(attn_metadata.slot_mapping, output, 1, -1)
+        diag_ring(
+            1,  # tag: backend entry
+            num_actual_tokens,
+            attn_metadata.max_query_len,
+            attn_metadata.max_seq_len,
+            self.num_heads,
+            self.head_size,
+            self.num_kv_heads,
+            attn_metadata.block_table.shape[0],
+            attn_metadata.block_table.shape[-1],
+            getattr(attn_metadata, "num_reqs", -1),
+            attn_metadata.query_start_loc.shape[0],
+            attn_metadata.seq_lens.shape[0],
+        )
+        # Host-side facts, written directly into host-mapped memory (eager path).
+        diag_py(
+            num_actual_tokens,
+            getattr(attn_metadata, "num_reqs", -1) or -1,
+            attn_metadata.max_query_len,
+            attn_metadata.max_seq_len,
+            attn_metadata.block_table.dim(),
+            attn_metadata.block_table.shape[0],
+            attn_metadata.block_table.shape[-1],
+            attn_metadata.block_table.stride(0),
+            attn_metadata.block_table.dtype.itemsize,
+            attn_metadata.seq_lens.shape[0],
+            attn_metadata.query_start_loc.shape[0],
+            kv_cache.shape[0],
+            kv_cache.shape[1],
+            kv_cache.shape[2],
+            self.head_size,
+            self.num_kv_heads,
+        )
+        diag_scan(getattr(attn_metadata, "block_table", None), output, 2, -1)
 
         # Handle encoder attention differently - no KV cache needed
         if attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
@@ -1185,6 +1225,7 @@ class FlashAttentionImpl(AttentionImpl):
                 # ("FA2 does not support num_splits > 1"), which leaves the whole KV
                 # sequence read by num_kv_heads thread blocks; the standalone kernel
                 # below tiles the query and the KV so the grid fills the device.
+                diag_mark(output, 3000 + 0)
                 if (
                     _spec_attn_enabled()
                     and 1 < max_seqlen_q <= _spec_attn_qmax(self)
@@ -1200,6 +1241,7 @@ class FlashAttentionImpl(AttentionImpl):
                     and mm_mask_mod is None
                     and rswa_mask_mod_fn is None
                 ):
+                    diag_mark(output, 3000 + 1)
                     if _spec_attn_run(
                         self,
                         query[:num_actual_tokens],
@@ -1214,6 +1256,7 @@ class FlashAttentionImpl(AttentionImpl):
                     ):
                         return output
 
+                diag_mark(output, 3000 + 2)
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
                     k=key_cache,
@@ -1240,9 +1283,26 @@ class FlashAttentionImpl(AttentionImpl):
                     mask_mod=rswa_mask_mod_fn or mm_mask_mod,
                     aux_tensors=rswa_aux or mm_aux,
                 )
+                diag_mark(output, 3000 + 3)
                 return output
 
         # Cascade attention (rare case).
+        diag_mark(output, 3000 + 8)
+        diag_scan(attn_metadata.suffix_kv_lens, output, 3, -1)
+        diag_scan(attn_metadata.prefix_kv_lens, output, 4, -1)
+        diag_ring(
+            3,  # tag: cascade entry
+            num_actual_tokens,
+            attn_metadata.max_query_len,
+            attn_metadata.max_seq_len,
+            attn_metadata.common_prefix_len,
+            attn_metadata.cu_prefix_query_lens.shape[0],
+            attn_metadata.prefix_kv_lens.shape[0],
+            attn_metadata.suffix_kv_lens.shape[0],
+            attn_metadata.block_table.shape[0],
+            attn_metadata.block_table.shape[-1],
+            getattr(attn_metadata, "num_reqs", -1),
+        )
         cascade_attention(
             output[:num_actual_tokens],
             query[:num_actual_tokens],
@@ -1269,6 +1329,7 @@ class FlashAttentionImpl(AttentionImpl):
             v_descale=layer._v_scale,
             s_aux=self.sinks,
         )
+        diag_mark(output, 3000 + 9)
         return output
 
     def do_kv_cache_update(
@@ -1296,6 +1357,14 @@ class FlashAttentionImpl(AttentionImpl):
         # and value[:num_actual_tokens] because the reshape_and_cache_flash
         # op uses the slot_mapping's shape to determine the number of
         # actual tokens.
+        import os as _os
+
+        if _os.environ.get("VLLM_DIAG_CLAMP_SLOTS", "0") == "1":
+            # DIAGNOSTIC ONLY: the runner pads slot_mapping with -1 for the unused
+            # tail (needed so the cache kernels can skip it) and hands the padded
+            # tensor here. Clamping the pads onto the null block tests whether a
+            # consumer mishandles the -1 entries.
+            slot_mapping = slot_mapping.clamp_min(0)
         reshape_and_cache_flash(
             key,
             value,
@@ -1834,6 +1903,7 @@ def cascade_attention(
     assert num_common_kv_blocks > 0
     descale_shape = (cu_prefix_query_lens.shape[0] - 1, key_cache.shape[-2])
 
+    diag_mark(query, 3000 + 10)
     # Process shared prefix.
     prefix_output, prefix_lse = flash_attn_varlen_func(
         q=query,
@@ -1885,8 +1955,10 @@ def cascade_attention(
         num_splits=1 if envs.VLLM_BATCH_INVARIANT else max_num_splits,
     )
 
+    diag_mark(query, 3000 + 11)
     # Merge prefix and suffix outputs, and store the result in output.
     merge_attn_states(output, prefix_output, prefix_lse, suffix_output, suffix_lse)
+    diag_mark(query, 3000 + 12)
 
 
 # ---- Split-KV spec-decode attention (ported from syv-ai/qwen38-27b-rtx3090) ----

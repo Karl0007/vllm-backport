@@ -46,6 +46,7 @@ def _spec_attn_partial(
     stride_vb, stride_vs, stride_vh,
     stride_bt,
     G: tl.constexpr, Hq: tl.constexpr, QMAX: tl.constexpr, D: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+    MAX_REQS: tl.constexpr,
     BLOCK_M: tl.constexpr, TILE: tl.constexpr, NSEG: tl.constexpr, QT: tl.constexpr,
     NTILE: tl.constexpr,
 ):
@@ -54,6 +55,14 @@ def _spec_attn_partial(
     qtile = pid % NTILE
     kvh = tl.program_id(1)
     seg = tl.program_id(2)
+
+    # The partial buffers hold MAX_REQS requests (their capacity at allocation).
+    # A request slot beyond that must not index them: under CUDA-graph replay the
+    # caller cannot re-validate the batch, so the kernel bounds itself. The grid is
+    # built from the caller's request count, which can exceed the buffers when it is
+    # derived from a padded persistent buffer instead of the exact batch size.
+    if req >= MAX_REQS:
+        return
 
     q_start = tl.load(cu_q_ptr + req)
     q_len = tl.load(cu_q_ptr + req + 1) - q_start
@@ -66,6 +75,16 @@ def _spec_attn_partial(
     # failing either test is inert (the combine kernel applies the same test, so it never
     # reads a partial that was not written).
     if kv_len <= 0 or q_start < 0 or q_start + q_len > total_tokens:
+        return
+    if q_len > QMAX:
+        # The partial buffers are sized by QMAX (fixed at capture time); a query
+        # block longer than that would index past them. Record and skip.
+        tl.store(diag_ptr + 0, 2)
+        tl.store(diag_ptr + 1, req)
+        tl.store(diag_ptr + 2, q_len)
+        tl.store(diag_ptr + 3, QMAX)
+        tl.store(diag_ptr + 4, total_tokens)
+        tl.store(diag_ptr + 5, kv_len)
         return
 
     # rows: r = i * G + g  -> query token qtile * QT + i (0..q_len-1), head kvh*G + g
@@ -150,13 +169,15 @@ def _spec_attn_combine(
     part_o_ptr, part_m_ptr, part_l_ptr, out_ptr, cu_q_ptr, seqused_ptr, total_tokens,
     stride_ot, stride_oh,
     Hq: tl.constexpr, QMAX: tl.constexpr, D: tl.constexpr, NSEG: tl.constexpr,
-    NOOP: tl.constexpr,
+    NOOP: tl.constexpr, MAX_REQS: tl.constexpr,
 ):
     if NOOP:
         return
     req = tl.program_id(0)
     h = tl.program_id(1)
     i = tl.program_id(2)
+    if req >= MAX_REQS:
+        return
     q_start = tl.load(cu_q_ptr + req)
     q_len = tl.load(cu_q_ptr + req + 1) - q_start
     # Same padded-buffer guard as the partial kernel, so the two agree on which slots
@@ -181,6 +202,9 @@ def _spec_attn_combine(
         o = tl.sum(o * w[:, None], 0) / tl.maximum(l_tot, 1e-30)
         row = tl.minimum(tl.maximum(q_start + i, 0), tl.maximum(total_tokens - 1, 0))
         tl.store(out_ptr + row * stride_ot + h * stride_oh + d, o.to(out_ptr.dtype.element_ty))
+
+
+ATTN_DIAG_OFF = 2 * 16384 + 8 + 64  # after copy/prod/progress/scan regions
 
 
 class SpecDecodeAttention:
@@ -222,9 +246,36 @@ class SpecDecodeAttention:
         return block_m, qt, triton.cdiv(q_len, qt), 8 if block_m >= 128 else 4
 
     def run(self, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, scale, num_reqs, max_query_len):
+        from vllm.v1.worker.mamba_utils import diag_mark, get_diag_buffer
+
+        diag_mark(out, 3000 + 4)
+        _buf, _stride, _has = get_diag_buffer()
+        # Record the kernel's own guard hits in host-mapped memory: a device-side
+        # diag dies with the CUDA context, which is exactly when it is needed.
+        diag_ptr = _buf[ATTN_DIAG_OFF : ATTN_DIAG_OFF + 16] if _has else self.diag
         Hq, D = q.shape[1], q.shape[2]
         Hkv = key_cache.shape[2]
         G = Hq // Hkv
+        from vllm.v1.worker.mamba_utils import diag_ring
+
+        diag_ring(
+            2,
+            num_reqs,
+            max_query_len,
+            q.shape[0],
+            key_cache.shape[0],
+            key_cache.shape[1],
+            self.qmax,
+            Hq,
+            Hkv,
+            block_table.dim(),
+            block_table.shape[0],
+            block_table.stride(0),
+            block_table.shape[-1],
+            key_cache.stride(0),
+            cu_seqlens_q.shape[0],
+            seqused_k.shape[0],
+        )
         assert max_query_len <= self.qmax, "too many query tokens per request for this kernel"
         assert num_reqs <= self.max_num_reqs
         # shared memory on sm86 is 99 KB: q tile + one K and one V tile + scores must fit
@@ -246,15 +297,20 @@ class SpecDecodeAttention:
             value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
             block_table.stride(0),
             G=G, Hq=Hq, QMAX=self.qmax, D=D, BLOCK_SIZE=key_cache.shape[1], BLOCK_M=block_m,
+            MAX_REQS=self.max_num_reqs,
             TILE=tile, NSEG=self.nseg, QT=qt, NTILE=ntile,
             num_warps=warps, num_stages=1,
         )
+        diag_mark(out, 3000 + 6)
         _spec_attn_combine[(num_reqs, Hq, max_query_len)](
             self.part_o, self.part_m, self.part_l, out, cu_seqlens_q, seqused_k,
             q.shape[0],
             out.stride(0), out.stride(1),
             Hq=Hq, QMAX=self.qmax, D=D, NSEG=self.nseg,
             NOOP=os.environ.get("VLLM_SPEC_ATTN_NOOP_COMBINE", "0") == "1",
+            MAX_REQS=self.max_num_reqs,
             num_warps=4,
         )
+        diag_mark(out, 3000 + 7)
+        diag_mark(out, 3000 + 5)
         return out

@@ -27,6 +27,7 @@ from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
 from vllm.v1.worker.mamba_utils import (
+    get_diag_buffer,
     MambaSpecDecodeGPUContext,
     get_mamba_group_ids,
     get_mamba_groups,
@@ -261,7 +262,10 @@ class MambaHybridModelState(DefaultModelState):
         # the launch cost is ~0.3% of TPOT, so the GPU fast-exit suffices.)
         block = 256
         grid = (triton.cdiv(num_reqs, block),)
+        diag_buf, _diag_stride, has_diag = get_diag_buffer()
         preprocess_mamba_align_fused_kernel[grid](
+            diag_buf,
+            has_diag,
             input_batch.idx_mapping,
             self._mamba_state_idx_gpu,
             num_computed_tokens,

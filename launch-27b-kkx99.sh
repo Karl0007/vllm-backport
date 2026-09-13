@@ -103,7 +103,7 @@ done
 # Split-KV spec-decode attention + the backends it plugs into: same convention as
 # the model files above (this checkout's copy wins over the image's), so a kernel
 # tweak is a container restart rather than an image rebuild.
-for _f in "v1/attention/ops/spec_decode_attn.py" "v1/attention/backends/flash_attn.py" "v1/core/single_type_kv_cache_manager.py" "v1/worker/gpu/model_states/mamba_hybrid.py" "v1/worker/mamba_utils.py"; do
+for _f in "v1/attention/ops/spec_decode_attn.py" "v1/attention/backends/flash_attn.py" "v1/core/single_type_kv_cache_manager.py" "v1/worker/gpu/model_states/mamba_hybrid.py" "v1/worker/mamba_utils.py" "model_executor/models/qwen3_next.py"; do
   PATCH_ARGS+=(-v "$HERE/vllm/$_f:/usr/local/lib/python3.12/dist-packages/vllm/$_f:ro")
 done
 if [ "${PATCH_DFLASH_QUANT_DRAFTER:-0}" = "1" ]; then
@@ -136,6 +136,7 @@ sudo docker run --rm \
   "${PATCH_ARGS[@]}" \
   -v "$TEMPLATES":/templates:ro \
   -v "$CACHE_DIR/vllm":/root/.cache/vllm \
+  ${VLLM_MAMBA_DIAG_MOUNT:+-v /dev/shm/vllm-diag:/dev/shm/vllm-diag} \
   -v "$CACHE_DIR/triton":/root/.cache/triton \
   -v "$CACHE_DIR/inductor":/root/.cache/torchinductor \
   "$IMAGE" \

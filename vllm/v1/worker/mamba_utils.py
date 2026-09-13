@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import os
 import itertools
 from collections.abc import Callable
 from typing import Any, NamedTuple
@@ -188,8 +189,209 @@ def _reinterpret_u64_as_i64(value: int) -> int:
     return value if value < (1 << 63) else value - (1 << 64)
 
 
+# Inside the container; the launcher bind-mounts the vllm cache dir from the
+# host, so the capture file outlives an engine crash.
+_DIAG_PATH = os.environ.get("VLLM_MAMBA_DIAG_PATH", "/root/.cache/vllm/mamba_diag.bin")
+_DIAG_REQS = 16
+_DIAG_STATES = tl.constexpr(64)
+_DIAG_FIELDS = tl.constexpr(16)
+_DIAG_SLOTS = int(_DIAG_REQS) * int(_DIAG_STATES) * int(_DIAG_FIELDS)
+# Producer records (preprocess advance / postprocess decision) live in a second
+# region of the same buffer, so the two kernel families never share a slot.
+_DIAG_PROD_OFF = tl.constexpr(_DIAG_SLOTS)
+_DIAG_PROD_STRIDE = tl.constexpr(64)
+_DIAG_PROG_OFF: tl.constexpr = 2 * _DIAG_SLOTS
+# Scan region: 8 programs x 8 slots (8192 tokens / 1024).
+_DIAG_SCAN_OFF: tl.constexpr = 2 * _DIAG_SLOTS + 8
+_DIAG_SCAN_PROGS: tl.constexpr = 8
+_DIAG_BUF = None
+_DIAG_DUMMY = None
+
+
+def get_diag_buffer():
+    """(buffer, copy_stride, has_diag) for the diagnostic build.
+
+    ``VLLM_MAMBA_DIAG=1`` opens the host-mapped capture buffer; otherwise a
+    one-element device tensor is returned with ``has_diag=False`` so the
+    kernels compile the same way but never store.
+    """
+    global _DIAG_BUF, _DIAG_DUMMY
+    import os
+
+    import torch
+
+    if os.environ.get("VLLM_MAMBA_DIAG", "0") != "1":
+        if _DIAG_DUMMY is None:
+            _DIAG_DUMMY = torch.zeros(1, dtype=torch.int64, device="cuda")
+        return _DIAG_DUMMY, 1, False
+    if _DIAG_BUF is None:
+        _DIAG_BUF = open_diag_buffer()
+    return _DIAG_BUF, int(_DIAG_STATES) * int(_DIAG_FIELDS), True
+
+
+@triton.jit
+def _diag_mark_kernel(ptr, value, x):
+    # Also rewrites x[0] with its own value: a declared in-place write keeps the
+    # compiler from deleting the marker, and the value is unchanged.
+    tl.store(ptr, value)
+    tl.store(x, tl.load(x))
+
+
+@torch.library.custom_op("vllm::diag_mark", mutates_args={"x"})
+def _diag_mark_op(x: torch.Tensor, value: int) -> None:
+    # Body runs eagerly at runtime; the env check and the buffer creation live
+    # here so the caller stays traceable inside a compiled / captured forward.
+    import os
+
+    if os.environ.get("VLLM_MAMBA_DIAG", "0") == "1":
+        buf, _stride, _has = get_diag_buffer()
+        _diag_mark_kernel[(1,)](buf[_DIAG_PROG_OFF:], value, x)
+
+
+@_diag_mark_op.register_fake
+def _diag_mark_fake(x: torch.Tensor, value: int) -> None:
+    return None
+
+
+@triton.jit
+def _diag_scan_kernel(x_ptr, n, out_ptr, tag, layer, scratch):
+    """Record negative entries of a metadata tensor (diagnostic only)."""
+    pid = tl.program_id(0)
+    offs = pid * 1024 + tl.arange(0, 1024)
+    m = offs < n
+    v = tl.load(x_ptr + offs, mask=m, other=0).to(tl.int64)
+    bad = m & (v < 0)
+    c = tl.sum(bad.to(tl.int32))
+    if c > 0:
+        i = tl.min(tl.where(bad, offs, n))
+        tl.store(out_ptr + pid * 8 + 0, c)
+        tl.store(out_ptr + pid * 8 + 1, i)
+        tl.store(out_ptr + pid * 8 + 2, tl.load(x_ptr + i).to(tl.int64))
+        tl.store(out_ptr + pid * 8 + 3, tag)
+        tl.store(out_ptr + pid * 8 + 4, layer)
+        tl.store(out_ptr + pid * 8 + 5, n)
+    tl.store(scratch, tl.load(scratch))
+
+
+@torch.library.custom_op("vllm::diag_scan", mutates_args={"scratch"})
+def _diag_scan_op(x: torch.Tensor, scratch: torch.Tensor, tag: int, layer: int) -> None:
+    import os
+
+    if os.environ.get("VLLM_MAMBA_DIAG", "0") != "1":
+        return
+    buf, _stride, _has = get_diag_buffer()
+    n = x.numel()
+    grid = (min(_DIAG_SCAN_PROGS, (n + 1023) // 1024),)
+    _diag_scan_kernel[grid](x, n, buf[_DIAG_SCAN_OFF:], tag, layer, scratch)
+
+
+@_diag_scan_op.register_fake
+def _diag_scan_fake(x: torch.Tensor, scratch: torch.Tensor, tag: int, layer: int) -> None:
+    return None
+
+
+def diag_scan(x: torch.Tensor | None, scratch: torch.Tensor, tag: int, layer: int) -> None:
+    """Flag negative entries in a metadata tensor; scratch is written with its
+    own value so the compiler keeps the call. No-op unless VLLM_MAMBA_DIAG=1."""
+    if x is None:
+        return
+    _diag_scan_op(x, scratch, tag, layer)
+
+
+_DIAG_PY_OFF = 2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16
+_DIAG_PY_SLOTS = 64
+
+
+def diag_py(*values: int) -> None:
+    """Write host-side facts straight into the host-mapped capture buffer.
+
+    The capture buffer is host memory, so plain Python stores reach it with no
+    CUDA involvement and no synchronization, and they survive an engine crash.
+    Used from the eager attention backend to record metadata shapes/strides.
+    """
+    import os
+
+    if os.environ.get("VLLM_MAMBA_DIAG", "0") != "1":
+        return
+    buf, _stride, _has = get_diag_buffer()
+    for i, v in enumerate(values[: _DIAG_PY_SLOTS]):
+        buf[_DIAG_PY_OFF + i] = int(v)
+
+
+_DIAG_RING_OFF = 2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16 + _DIAG_PY_SLOTS
+_DIAG_RING_N = 512
+_DIAG_RING_FIELDS = 16
+_DIAG_RING_COUNTER = 0
+
+
+def diag_ring(*values: int) -> int:
+    """Append a record to a ring in host-mapped memory; returns the sequence number.
+
+    The last single write cannot say which call faulted when two models (target and
+    drafter) both pass through the same backend, so keep the ordered tail.
+    """
+    global _DIAG_RING_COUNTER
+    import os
+
+    if os.environ.get("VLLM_MAMBA_DIAG", "0") != "1":
+        return -1
+    buf, _stride, _has = get_diag_buffer()
+    idx = _DIAG_RING_COUNTER % _DIAG_RING_N
+    base = _DIAG_RING_OFF + idx * _DIAG_RING_FIELDS
+    buf[base] = _DIAG_RING_COUNTER
+    for i, v in enumerate(values[: _DIAG_RING_FIELDS - 1]):
+        buf[base + 1 + i] = int(v)
+    buf[_DIAG_RING_OFF + _DIAG_RING_N * _DIAG_RING_FIELDS] = _DIAG_RING_COUNTER + 1
+    _DIAG_RING_COUNTER += 1
+    return _DIAG_RING_COUNTER - 1
+
+
+def diag_mark(x: torch.Tensor, value: int) -> None:
+    """Per-layer progress marker (diagnostic only; identity unless VLLM_MAMBA_DIAG=1).
+
+    One thread, one store into host-mapped memory: the last value left in the
+    buffer after a crash says how far the faulting step got. Markers sit inside
+    the CUDA graph, so replays write them too. Returns its input unchanged; the
+    declared in-place write keeps the compiler from deleting the marker.
+    """
+    _diag_mark_op(x, value)
+
+
+def open_diag_buffer():
+    """Host-mapped capture buffer for the mamba state-copy path (diagnostic only).
+
+    A /dev/shm mapping registered as mapped host memory: device kernels write
+    into it with no synchronization, and because the backing store is a file,
+    the contents survive an engine crash (Xid 31 kills the CUDA context and all
+    device-side state) and can be read by any other process afterwards. Slot
+    layout is (batch_idx, state_idx, field); see ``diag_record``.
+    """
+    import ctypes
+    import mmap
+    import os
+
+    import torch
+
+    size = (2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16 + _DIAG_PY_SLOTS + 512 * 16 + 1) * 8
+    if not os.path.exists(_DIAG_PATH):
+        with open(_DIAG_PATH, "wb") as f:
+            f.write(b"\0" * size)
+    fd = os.open(_DIAG_PATH, os.O_RDWR)
+    buf = mmap.mmap(fd, size, prot=mmap.PROT_READ | mmap.PROT_WRITE)
+    addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
+    err = torch.cuda.cudart().cudaHostRegister(int(addr), size, 2)  # Mapped
+    if int(err) != 0:
+        raise RuntimeError(f"cudaHostRegister failed: {err}")
+    out = torch.frombuffer(buf, dtype=torch.int64, count=2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16 + _DIAG_PY_SLOTS + 512 * 16 + 1)
+    out.fill_(-1)
+    return out
+
+
 @triton.jit
 def _copy_mamba_state_block(
+    diag_ptr,
+    diag_stride,
+    has_diag,
     state_idx,
     bt_row_idx,
     src_col,
@@ -254,15 +456,40 @@ def _copy_mamba_state_block(
     # cache from that id (2026-09-13: Xid 31 with the fault address *below* the KV/state
     # segment, i.e. a negative block id). Guard both columns by the row width.
     table_width = block_table_stride_req
+    # Diagnostic capture slot for this (request, state) pair.
+    diag = diag_ptr + bt_row_idx * diag_stride + state_idx * 16
     # Both source indices are guarded: the conv path uses bt[src_col], the temporal
     # path uses bt[src_col + token_bias] (token_bias = num_accepted - 1, up to the
     # speculative block), and the token_bias offset can step past the row end even
     # when src_col itself is in range.
     if dst_col < 0 or dst_col >= table_width or src_col < 0 or src_col >= table_width:
+        if has_diag and state_idx < _DIAG_STATES:
+            if dst_col < 0 or dst_col >= table_width:
+                tl.store(diag + 11, dst_col)
+            else:
+                tl.store(diag + 12, src_col)
         return
     if src_col + token_bias >= table_width:
+        if has_diag and state_idx < _DIAG_STATES:
+            tl.store(diag + 13, src_col + token_bias)
         return
     dest_block_id = tl.load(block_table_base + dst_col).to(tl.int64)
+    # --- diagnostic capture (HAS_DIAG=0 in production) -----------------------
+    # Record the raw decision values BEFORE any address arithmetic, and only
+    # when something is already out of the expected domain. A null block id is
+    # 0 in this tree (NULL_BLOCK_ID); anything < 0 means the table column holds
+    # a sentinel/garbage value and the state address would land before the
+    # segment base.
+    bad = (dest_block_id < 0) | (src_col + token_bias < 0)
+    if has_diag and bad and state_idx < _DIAG_STATES:
+        tl.store(diag + 0, dest_block_id)
+        tl.store(diag + 1, src_col)
+        tl.store(diag + 2, dst_col)
+        tl.store(diag + 3, token_bias)
+        tl.store(diag + 4, table_width)
+        tl.store(diag + 5, state_idx)
+        tl.store(diag + 6, bt_row_idx)
+        tl.store(diag + 7, state_block_stride)
     dst_addr = state_base_addr + dest_block_id * state_block_stride
 
     is_conv_state = conv_width > 0
@@ -364,6 +591,10 @@ def _copy_mamba_state_block(
     # Body u64 range is partitioned across TEMPORAL_TILES CTAs to keep the
     # SMs filled at small batch.
     actual_src_block_id = tl.load(block_table_base + src_col + token_bias).to(tl.int64)
+    if has_diag and actual_src_block_id < 0 and state_idx < _DIAG_STATES:
+        tl.store(diag + 8, actual_src_block_id)
+        tl.store(diag + 9, src_col + token_bias)
+        tl.store(diag + 10, token_bias)
     src_addr = state_base_addr + actual_src_block_id * state_block_stride
     # Use natural block data size (inner_size * elem_size), NOT
     # state_block_stride which is the page stride and can exceed the
@@ -381,6 +612,9 @@ def _copy_mamba_state_block(
 
 @triton.jit(do_not_specialize=["num_reqs"])
 def postprocess_mamba_fused_kernel(
+    diag_ptr,
+    diag_stride,
+    has_diag,
     # Decision inputs (per-request)
     num_accepted_tokens_ptr,
     mamba_state_idx_ptr,
@@ -488,6 +722,17 @@ def postprocess_mamba_fused_kernel(
     if src_block_idx == dest_block_idx and state_idx == 0 and tile_idx == 0:
         tl.store(num_accepted_tokens_out_ptr + req_idx, 1)
 
+    if has_diag and (accept_token_bias < 0 or (dest_block_idx < 0 and new_num_computed > 0)):
+        prod = diag_ptr + _DIAG_PROD_OFF + req_idx * _DIAG_PROD_STRIDE + 8
+        tl.store(prod + 0, src_block_idx)
+        tl.store(prod + 1, dest_block_idx)
+        tl.store(prod + 2, accept_token_bias)
+        tl.store(prod + 3, new_num_computed)
+        tl.store(prod + 4, num_tokens_running_state)
+        tl.store(prod + 5, aligned_new_computed)
+        tl.store(prod + 6, block_size)
+        tl.store(prod + 7, num_accepted)
+
     # Skip no-op self-copy.
     if src_block_idx == dest_block_idx and accept_token_bias == 0:
         return
@@ -504,6 +749,9 @@ def postprocess_mamba_fused_kernel(
     # PLE conv state (all-NaN logits -> constant-token loops; vllm#54173).
     bt_row_idx = req_idx
     _copy_mamba_state_block(
+        diag_ptr,
+        diag_stride,
+        has_diag,
         state_idx,
         bt_row_idx,
         src_block_idx,
@@ -528,6 +776,8 @@ def postprocess_mamba_fused_kernel(
 
 @triton.jit(do_not_specialize=["num_reqs"])
 def preprocess_mamba_align_fused_kernel(
+    diag_ptr,
+    has_diag,
     idx_mapping_ptr,
     state_idx_ptr,
     num_computed_tokens_ptr,
@@ -575,6 +825,18 @@ def preprocess_mamba_align_fused_kernel(
     query_end = tl.load(query_start_loc_ptr + offsets + 1, mask=mask, other=0)
     computed_after = num_computed + query_end - query_start
     new_state_idx = (computed_after + MAMBA_BLOCK_SIZE - 1) // MAMBA_BLOCK_SIZE - 1
+    # Diagnostic: a decode step must never skip a block column, and a negative
+    # column with tokens computed is out of domain. Record the raw inputs.
+    if has_diag:
+        jump = new_state_idx - state_idx
+        suspicious = ((computed_after > 0) & (new_state_idx < 0)) | (jump > 1)
+        prod = diag_ptr + _DIAG_PROD_OFF + req_indices * _DIAG_PROD_STRIDE
+        tl.store(prod + 0, state_idx, mask=mask & suspicious)
+        tl.store(prod + 1, new_state_idx, mask=mask & suspicious)
+        tl.store(prod + 2, computed_after, mask=mask & suspicious)
+        tl.store(prod + 3, num_accepted, mask=mask & suspicious)
+        tl.store(prod + 4, query_end - query_start, mask=mask & suspicious)
+        tl.store(prod + 5, MAMBA_BLOCK_SIZE, mask=mask & suspicious)
     tl.store(state_idx_ptr + req_indices, new_state_idx, mask=mask)
     should_reset = (state_idx >= 0) & (state_idx != new_state_idx)
     tl.store(num_accepted_tokens_ptr + req_indices, 1, mask=mask & should_reset)
@@ -582,6 +844,9 @@ def preprocess_mamba_align_fused_kernel(
 
 @triton.jit(do_not_specialize=["num_reqs"])
 def precopy_mamba_align_fused_kernel(
+    diag_ptr,
+    diag_stride,
+    has_diag,
     # Per-request-slot inputs (indexed by req_idx via idx_mapping), produced by
     # the V2 fused align preprocess kernel for the current step:
     mamba_state_idx_ptr,  # post-advance dst block column
@@ -643,6 +908,9 @@ def precopy_mamba_align_fused_kernel(
 
     token_bias = tl.load(token_bias_ptr + req_idx)
     _copy_mamba_state_block(
+        diag_ptr,
+        diag_stride,
+        has_diag,
         state_idx,
         # Source tables are req-indexed (see postprocess_mamba_fused_kernel).
         req_idx,
@@ -1195,8 +1463,12 @@ class MambaSpecDecodeGPUContext:
 
         total_states = self.num_states
         grid = (num_reqs, total_states, _TEMPORAL_TILES)
+        diag_buf, diag_stride, has_diag = get_diag_buffer()
 
         postprocess_mamba_fused_kernel[grid](
+            diag_buf,
+            diag_stride,
+            has_diag,
             num_accepted_tokens_gpu,
             mamba_state_idx_gpu,
             num_scheduled_tokens_gpu,
@@ -1250,7 +1522,11 @@ class MambaSpecDecodeGPUContext:
             return
         total_states = self.num_states
         grid = (num_reqs, total_states, _TEMPORAL_TILES)
+        diag_buf, diag_stride, has_diag = get_diag_buffer()
         precopy_mamba_align_fused_kernel[grid](
+            diag_buf,
+            diag_stride,
+            has_diag,
             state_idx_gpu,
             src_col_gpu,
             token_bias_gpu,
@@ -1307,7 +1583,11 @@ class MambaSpecDecodeGPUContext:
 
         total_states = self.num_states
         grid = (num_reqs, total_states, _TEMPORAL_TILES)
+        diag_buf, diag_stride, has_diag = get_diag_buffer()
         postprocess_mamba_fused_kernel[grid](
+            diag_buf,
+            diag_stride,
+            has_diag,
             num_accepted_tokens_snapshot,
             state_idx_gpu,
             None,  # num_scheduled: unused under PRECOMPUTED_NEW_COMPUTED

@@ -33,6 +33,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.v1.worker.mamba_utils import diag_mark, diag_scan
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
 )
@@ -281,6 +282,7 @@ class Qwen3NextAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.diag_layer_idx = extract_layer_index(prefix) if prefix else -1
         self.hidden_size = config.hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = config.num_attention_heads
@@ -450,12 +452,17 @@ class Qwen3NextAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        _li = self.diag_layer_idx
+        diag_mark(hidden_states, 1000 + _li * 8 + 0)
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, gate = self._project_qkv_gate(qkv, positions)
+        diag_mark(q, 1000 + _li * 8 + 1)
         attn_output = self.attn(q, k, v)
+        diag_mark(attn_output, 1000 + _li * 8 + 2)
         if gate is not None:
             attn_output = attn_output * torch.sigmoid(gate)
         output, _ = self.o_proj(attn_output)
+        diag_mark(output, 1000 + _li * 8 + 3)
         return output
 
 
@@ -554,6 +561,7 @@ class Qwen3NextDecoderLayer(nn.Module):
     ):
         full_num_tokens = positions.shape[-1]
 
+        diag_mark(hidden_states, self.layer_idx * 4 + 0)
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -574,6 +582,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             raise ValueError("Invalid layer_type")
 
+        diag_mark(hidden_states, self.layer_idx * 4 + 1)
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
                 hidden_states = hidden_states * (
@@ -602,6 +611,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             hidden_states = self.mlp(hidden_states)
 
+        diag_mark(hidden_states, self.layer_idx * 4 + 2)
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
                 hidden_states = hidden_states * (
