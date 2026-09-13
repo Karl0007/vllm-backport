@@ -1023,6 +1023,9 @@ class FlashAttentionImpl(AttentionImpl):
         # at the attention entry; the last marker before a crash brackets the
         # faulting call.
         diag_scan(attn_metadata.slot_mapping, output, 1, -1)
+        # Upper bound too: a block id beyond the pool is just as wild as a negative one,
+        # and the consumers only exclude the null id.
+        diag_scan(attn_metadata.block_table, output, 5, -1, kv_cache.shape[0])
         diag_ring(
             1,  # tag: backend entry
             num_actual_tokens,

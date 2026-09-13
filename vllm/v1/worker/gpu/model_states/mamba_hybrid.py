@@ -233,15 +233,39 @@ class MambaHybridModelState(DefaultModelState):
             self._seg_logged = True
             import logging as _logging
 
+            import os as _o
+
+            _find = int(_o.environ.get("VLLM_SEG_FIND", "0"), 16)
+            _snap = torch.cuda.memory_snapshot()
             _seg = [
                 (int(seg["address"]), int(seg["total_size"]), seg.get("segment_type", ""))
-                for seg in torch.cuda.memory_snapshot()
+                for seg in _snap
             ]
             _seg.sort(key=lambda x: -x[1])
-            for _a, _sz, _t in _seg[:12]:
+            # Print every segment: the faulting address has to be mapped to one of them.
+            for _a, _sz, _t in _seg:
                 _logging.getLogger("vllm.mamba").warning(
                     "CUDA_SEG addr=%#x end=%#x size=%.1f MiB %s", _a, _a + _sz, _sz / 2**20, _t
                 )
+            # And the block map of the segment holding the requested address (the Xid
+            # fault address is stable across runs, so it can be looked up directly).
+            for seg in _snap:
+                _a = int(seg["address"])
+                if _find and _a <= _find < _a + int(seg["total_size"]):
+                    _logging.getLogger("vllm.mamba").warning(
+                        "SEG_HIT %#x in [%#x,%#x) type=%s blocks=%d",
+                        _find, _a, _a + int(seg["total_size"]),
+                        seg.get("segment_type", ""), len(seg.get("blocks", [])),
+                    )
+                    _blocks = sorted(
+                        seg.get("blocks", []), key=lambda b: -int(b["size"])
+                    )
+                    for b in _blocks[:20]:
+                        _ba = int(b.get("address", 0))
+                        _logging.getLogger("vllm.mamba").warning(
+                            "  SEG_BLK addr=%#x end=%#x size=%.1f MiB state=%s",
+                            _ba, _ba + int(b["size"]), int(b["size"]) / 2**20, b.get("state", ""),
+                        )
         if self._pending_state_seed:
             # Seed from the resumed position with the mamba block size, before any
             # kernel reads state_idx.

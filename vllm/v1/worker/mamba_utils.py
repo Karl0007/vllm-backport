@@ -265,13 +265,15 @@ def _diag_mark_fake(x: torch.Tensor, value: int, layer: int = -1) -> None:
 
 
 @triton.jit
-def _diag_scan_kernel(x_ptr, n, out_ptr, tag, layer, scratch):
-    """Record negative entries of a metadata tensor (diagnostic only)."""
+def _diag_scan_kernel(x_ptr, n, out_ptr, tag, layer, scratch, upper):
+    """Record out-of-range entries of a metadata tensor (diagnostic only)."""
     pid = tl.program_id(0)
     offs = pid * 1024 + tl.arange(0, 1024)
     m = offs < n
     v = tl.load(x_ptr + offs, mask=m, other=0).to(tl.int64)
     bad = m & (v < 0)
+    if upper > 0:
+        bad = bad | (m & (v >= upper))
     c = tl.sum(bad.to(tl.int32))
     if c > 0:
         i = tl.min(tl.where(bad, offs, n))
@@ -281,11 +283,13 @@ def _diag_scan_kernel(x_ptr, n, out_ptr, tag, layer, scratch):
         tl.store(out_ptr + pid * 8 + 3, tag)
         tl.store(out_ptr + pid * 8 + 4, layer)
         tl.store(out_ptr + pid * 8 + 5, n)
+        tl.store(out_ptr + pid * 8 + 6, upper)
     tl.store(scratch, tl.load(scratch))
 
 
 @torch.library.custom_op("vllm::diag_scan", mutates_args={"scratch"})
-def _diag_scan_op(x: torch.Tensor, scratch: torch.Tensor, tag: int, layer: int) -> None:
+def _diag_scan_op(x: torch.Tensor, scratch: torch.Tensor, tag: int, layer: int,
+                  upper: int = -1) -> None:
     import os
 
     if os.environ.get("VLLM_MAMBA_DIAG", "0") != "1":
@@ -293,20 +297,22 @@ def _diag_scan_op(x: torch.Tensor, scratch: torch.Tensor, tag: int, layer: int) 
     buf, _stride, _has = get_diag_buffer()
     n = x.numel()
     grid = (min(_DIAG_SCAN_PROGS, (n + 1023) // 1024),)
-    _diag_scan_kernel[grid](x, n, buf[_DIAG_SCAN_OFF:], tag, layer, scratch)
+    _diag_scan_kernel[grid](x, n, buf[_DIAG_SCAN_OFF:], tag, layer, scratch, upper)
 
 
 @_diag_scan_op.register_fake
-def _diag_scan_fake(x: torch.Tensor, scratch: torch.Tensor, tag: int, layer: int) -> None:
+def _diag_scan_fake(x: torch.Tensor, scratch: torch.Tensor, tag: int, layer: int,
+                    upper: int = -1) -> None:
     return None
 
 
-def diag_scan(x: torch.Tensor | None, scratch: torch.Tensor, tag: int, layer: int) -> None:
+def diag_scan(x: torch.Tensor | None, scratch: torch.Tensor, tag: int, layer: int,
+              upper: int = -1) -> None:
     """Flag negative entries in a metadata tensor; scratch is written with its
     own value so the compiler keeps the call. No-op unless VLLM_MAMBA_DIAG=1."""
     if x is None:
         return
-    _diag_scan_op(x, scratch, tag, layer)
+    _diag_scan_op(x, scratch, tag, layer, upper)
 
 
 _DIAG_PY_OFF = 2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16 + 512 * 16 + 1 + 4 * 512
@@ -877,6 +883,12 @@ def preprocess_mamba_align_fused_kernel(
     query_end = tl.load(query_start_loc_ptr + offsets + 1, mask=mask, other=0)
     computed_after = num_computed + query_end - query_start
     new_state_idx = (computed_after + MAMBA_BLOCK_SIZE - 1) // MAMBA_BLOCK_SIZE - 1
+    # computed_after == 0 (a padded row: nothing computed, nothing scheduled) would give
+    # -1 here. The consumers only exclude the null block id (0), so a negative column
+    # walks state_ptr + idx * stride far below the cache and faults the GPU (Xid 31 at a
+    # stable address ~4 GB under the KV cache). Every other producer clamps; do it here
+    # too, which lands padded rows on the null block that the consumers skip.
+    new_state_idx = tl.maximum(new_state_idx, 0)
     # Diagnostic: a decode step must never skip a block column, and a negative
     # column with tokens computed is out of domain. Record the raw inputs.
     if has_diag:
