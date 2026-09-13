@@ -341,6 +341,13 @@ class SpecDecodeAttention:
         # + scores 16 KB = 112 KB, under sm80's 164 KB.
         tile = 64 if (block_m <= 32 or D <= 256) else 32
         grid = (num_reqs * ntile, Hkv, self.nseg)
+        import os as _os
+
+        if _os.environ.get("VLLM_SPEC_ATTN_SKIP_PARTIAL", "0") == "1":
+            # Diagnostic bisect: skip the partial kernel (the combine then reads stale
+            # partials, so results are wrong) to decide which of the two kernels faults.
+            diag_mark(out, 3000 + 5)
+            return out
         _spec_attn_partial[grid](
             q, key_cache, value_cache, block_table, seqused_k, cu_seqlens_q,
             q.shape[0], key_cache.shape[0], self.diag,
