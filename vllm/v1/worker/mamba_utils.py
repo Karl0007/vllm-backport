@@ -228,13 +228,19 @@ def get_diag_buffer():
 
 
 @triton.jit
-def _diag_mark_kernel(ptr, value, x, counter_ptr, layer_ptr, layer):
+def _diag_mark_kernel(ptr, value, x, counter_ptr, layer_ptr, layer, ring_ptr, ring_n,
+                      ring_fields):
     # Also rewrites x[0] with its own value: a declared in-place write keeps the
     # compiler from deleting the marker, and the value is unchanged. The counter
     # counts executed markers: during a CUDA-graph replay no Python runs, so this
     # is the only way to tell how far the replay got.
     tl.store(ptr, value)
-    tl.store(counter_ptr, tl.load(counter_ptr) + 1)
+    _c = tl.load(counter_ptr)
+    tl.store(counter_ptr, _c + 1)
+    # Kernel-side ring of the last markers: survives a crash and works during graph
+    # replay (no Python there), which is the only way to see how far a replay got.
+    tl.store(ring_ptr + (_c % ring_n) * ring_fields, _c)
+    tl.store(ring_ptr + (_c % ring_n) * ring_fields + 1, value)
     if layer >= 0:
         # Per-layer progress: which layers completed tells a post-mortem how far a
         # graph replay got (no Python runs there).
@@ -251,7 +257,8 @@ def _diag_mark_op(x: torch.Tensor, value: int, layer: int = -1) -> None:
     if os.environ.get("VLLM_MAMBA_DIAG", "0") == "1":
         buf, _stride, _has = get_diag_buffer()
         _diag_mark_kernel[(1,)](buf[_DIAG_PROG_OFF:], value, x,
-                                buf[_DIAG_MARK_COUNT_OFF:], buf[_DIAG_LAYER_OFF:], layer)
+                                buf[_DIAG_MARK_COUNT_OFF:], buf[_DIAG_LAYER_OFF:], layer,
+                                buf[_DIAG_MRING_OFF:], _DIAG_MRING_N, _DIAG_MRING_FIELDS)
 
 
 @_diag_mark_op.register_fake
@@ -374,7 +381,10 @@ _DIAG_SCAN_OFF: tl.constexpr = _DIAG_LAYER_OFF + _DIAG_LAYER_N
 _DIAG_PY_OFF = _DIAG_SCAN_OFF + _DIAG_SCAN_PROGS * 8 + 48
 _DIAG_RING_OFF = _DIAG_PY_OFF + _DIAG_PY_SLOTS
 _DIAG_DUMP_OFF: tl.constexpr = _DIAG_RING_OFF + _DIAG_RING_N * _DIAG_RING_FIELDS + 1
-_DIAG_TOTAL = _DIAG_DUMP_OFF + _DIAG_DUMP_SLOTS * _DIAG_DUMP_LEN
+_DIAG_MRING_OFF = _DIAG_DUMP_OFF + _DIAG_DUMP_SLOTS * _DIAG_DUMP_LEN
+_DIAG_MRING_N = 512
+_DIAG_MRING_FIELDS = 2
+_DIAG_TOTAL = _DIAG_MRING_OFF + _DIAG_MRING_N * _DIAG_MRING_FIELDS
 
 
 @triton.jit

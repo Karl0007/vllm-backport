@@ -79,9 +79,16 @@ def _spec_attn_partial(
     if req >= MAX_REQS:
         return
 
+    # Reached the kernel body (before the three metadata loads that follow): if this
+    # marker is the last written, the fault is in those loads.
+    tl.store(diag_ptr + 22, 22)
+    tl.store(diag_ptr + 23, req)
     q_start = tl.load(cu_q_ptr + req)
+    tl.store(diag_ptr + 24, 24)   # q_start 读取成功
     q_len = tl.load(cu_q_ptr + req + 1) - q_start
+    tl.store(diag_ptr + 25, 25)   # q_len 读取成功
     kv_len = tl.load(seqused_ptr + req)
+    tl.store(diag_ptr + 26, 26)   # kv_len 读取成功（三次 load 全部安全）
 
     # cu_seqlens_q is a padded persistent buffer: only [:num_reqs + 1] is written each
     # step, so the tail keeps the previous (larger) batch's prefix sums. seqused_k pads
@@ -296,6 +303,22 @@ class SpecDecodeAttention:
             scale, num_reqs, max_query_len, k_scale=1.0, v_scale=1.0):
         from vllm.v1.worker.mamba_utils import diag_mark, get_diag_buffer
 
+        import vllm.v1.worker.mamba_utils as _mu
+
+        # Record the output/query buffer identity for this call: a dangling out pointer
+        # here is the suspected root cause (Xid 31 struck in the third full-attention
+        # call of a step, and the kernel body never ran -- the launch carried a pending
+        # error, i.e. `out` was already invalid).
+        _op = out.data_ptr()
+        _qp = q.data_ptr()
+        _mu.diag_py(
+            500,
+            _op & 0xFFFFFFFF,
+            _op >> 32,
+            int(out.numel()),
+            _qp & 0xFFFFFFFF,
+            _qp >> 32,
+        )
         diag_mark(out, 3000 + 4)
         import logging as _lg
 
