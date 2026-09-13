@@ -591,3 +591,12 @@
 # 下一步：对 rejection sampler（vllm/v1/sample/rejection_sampler.py，需加入挂载清单 ✗）
 # 做同样的标记 + 参数 dump ✗。
 # 注：我的 diag 区域偏移有重叠 ✗（layer 数组与 scan/hook 区撞了 ✗），下次需重排 ✗。
+
+# 【2026-09-13 拒绝采样器已排除；故障锁定在"层之后"的尾部】
+# 在 rejection_sampler.py 的 3 个内核里加了 num_draft_tokens 界守卫 + 条件 printf
+# （cu_num_draft_tokens 是持久缓冲 ✗，理论上会有陈旧尾巴 ✗）：整轮复现 **0 次命中** ✗
+# -> 拒绝采样器排除 ✓（守卫保留 ✓，它是正确的"构造即有界" ✓）。
+# 尾部剩余嫌疑（按可能性）：compute_logits/lm_head ✗、logits processor ✗、
+# sampler ✗、drafter 自身前向 ✗、mamba postprocess/align save ✗（此前已单独排除过 ✗）。
+# 下一步：把同样的标记 + dump 铺到尾部这几处（都在 v1/sample/ 与 gpu_model_runner 里 ✗，
+# 需加入挂载清单 ✓）。
