@@ -309,7 +309,7 @@ def diag_scan(x: torch.Tensor | None, scratch: torch.Tensor, tag: int, layer: in
     _diag_scan_op(x, scratch, tag, layer)
 
 
-_DIAG_PY_OFF = 2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16
+_DIAG_PY_OFF = 2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16 + 512 * 16 + 1 + 4 * 512
 _DIAG_PY_SLOTS = 64
 
 
@@ -424,7 +424,7 @@ def open_diag_buffer():
 
     import torch
 
-    size = (2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16 + _DIAG_PY_SLOTS + 512 * 16 + 1 + 4 * 512 + 128) * 8
+    size = (2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16 + _DIAG_PY_SLOTS + 512 * 16 + 1 + 4 * 512 + 128 + _DIAG_PY_SLOTS) * 8
     if not os.path.exists(_DIAG_PATH):
         with open(_DIAG_PATH, "wb") as f:
             f.write(b"\0" * size)
@@ -434,7 +434,7 @@ def open_diag_buffer():
     err = torch.cuda.cudart().cudaHostRegister(int(addr), size, 2)  # Mapped
     if int(err) != 0:
         raise RuntimeError(f"cudaHostRegister failed: {err}")
-    out = torch.frombuffer(buf, dtype=torch.int64, count=2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16 + _DIAG_PY_SLOTS + 512 * 16 + 1 + 4 * 512 + 128)
+    out = torch.frombuffer(buf, dtype=torch.int64, count=2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16 + _DIAG_PY_SLOTS + 512 * 16 + 1 + 4 * 512 + 128 + _DIAG_PY_SLOTS)
     out.fill_(-1)
     return out
 

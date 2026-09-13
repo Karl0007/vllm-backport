@@ -76,6 +76,17 @@ def _spec_attn_partial(
     # reads a partial that was not written).
     if kv_len <= 0 or q_start < 0 or q_start + q_len > total_tokens:
         return
+    # The block table read uses the LIVE kv_len against the table width captured in
+    # stride_bt; if the two disagree the column index walks past the row.
+    if kv_len > stride_bt * BLOCK_SIZE or kv_len > nblocks * BLOCK_SIZE:
+        tl.store(diag_ptr + 0, 3)
+        tl.store(diag_ptr + 1, req)
+        tl.store(diag_ptr + 2, kv_len)
+        tl.store(diag_ptr + 3, stride_bt)
+        tl.store(diag_ptr + 4, BLOCK_SIZE)
+        tl.store(diag_ptr + 5, nblocks)
+        tl.store(diag_ptr + 6, total_tokens)
+        return
     if q_len > QMAX:
         # The partial buffers are sized by QMAX (fixed at capture time); a query
         # block longer than that would index past them. Record and skip.
@@ -250,6 +261,11 @@ class SpecDecodeAttention:
         from vllm.v1.worker.mamba_utils import diag_mark, get_diag_buffer
 
         diag_mark(out, 3000 + 4)
+        # Unique sentinel: scanning the whole capture buffer for it proves whether this
+        # Python body ever ran (graph capture vs replay), independent of any offset math.
+        from vllm.v1.worker.mamba_utils import diag_py as _sentinel
+
+        _sentinel(77777, 88888)
         _buf, _stride, _has = get_diag_buffer()
         # Record the kernel's own guard hits in host-mapped memory: a device-side
         # diag dies with the CUDA context, which is exactly when it is needed.
