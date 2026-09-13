@@ -170,12 +170,22 @@ def main() -> int:
     patched = 0
     for root in roots:
         targets = {name: os.path.join(root, rel) for name, rel in PATCHES.items()}
-        if not all(os.path.exists(path) for path in targets.values()):
+        # A port may add files the base tree does not have (spec_decode_attn.py),
+        # so "every target already exists" is the wrong gate -- it made the whole
+        # apply step a no-op and failed the build with "no candidate tree
+        # contained the patch targets". Require at least one existing target to
+        # recognise a real install root, then let the copy create the rest.
+        if not any(os.path.exists(path) for path in targets.values()):
             continue
+        created: list[str] = []
         for name, rel in PATCHES.items():
             src = os.path.join(stage, name)
             if os.path.exists(src):
-                shutil.copy2(src, os.path.join(root, rel))
+                dst = os.path.join(root, rel)
+                if not os.path.exists(dst):
+                    created.append(rel)
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
 
         for rel, marker, why in REQUIRED:
             text = open(os.path.join(root, rel)).read()
@@ -190,7 +200,8 @@ def main() -> int:
             )
             return 1
         patched += 1
-        print(f"patched {root}")
+        suffix = f" (created {len(created)}: {', '.join(created)})" if created else ""
+        print(f"patched {root}{suffix}")
 
     if not patched:
         print("no candidate tree contained the patch targets", file=sys.stderr)
