@@ -371,7 +371,7 @@ _DIAG_PROG_OFF: tl.constexpr = _DIAG_PROD_OFF + _DIAG_REQS * _DIAG_PROD_STRIDE
 _DIAG_MARK_COUNT_OFF: tl.constexpr = _DIAG_PROG_OFF + 1
 _DIAG_LAYER_OFF: tl.constexpr = _DIAG_PROG_OFF + 2
 _DIAG_SCAN_OFF: tl.constexpr = _DIAG_LAYER_OFF + _DIAG_LAYER_N
-_DIAG_PY_OFF = _DIAG_SCAN_OFF + _DIAG_SCAN_PROGS * 8 + 16
+_DIAG_PY_OFF = _DIAG_SCAN_OFF + _DIAG_SCAN_PROGS * 8 + 48
 _DIAG_RING_OFF = _DIAG_PY_OFF + _DIAG_PY_SLOTS
 _DIAG_DUMP_OFF: tl.constexpr = _DIAG_RING_OFF + _DIAG_RING_N * _DIAG_RING_FIELDS + 1
 _DIAG_TOTAL = _DIAG_DUMP_OFF + _DIAG_DUMP_SLOTS * _DIAG_DUMP_LEN
@@ -467,7 +467,10 @@ def open_diag_buffer():
     import torch
 
     size = int(_DIAG_TOTAL) * 8
-    if not os.path.exists(_DIAG_PATH):
+    # Recreate when absent or smaller than the current layout (the layout grew during
+    # development; an old file would make mmap fail with "length is greater than file
+    # size").
+    if not os.path.exists(_DIAG_PATH) or os.path.getsize(_DIAG_PATH) < size:
         with open(_DIAG_PATH, "wb") as f:
             f.write(b"\0" * size)
     fd = os.open(_DIAG_PATH, os.O_RDWR)

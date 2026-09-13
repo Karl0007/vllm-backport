@@ -124,6 +124,7 @@ def _spec_attn_partial(
     # Bound every address by construction: a captured CUDA graph replays these kernels
     # with arguments fixed at capture time, so a single stale value must not be able to
     # turn into a wild address (2026-09-12: an Xid 31 read ~4.2 GB below the KV cache).
+    tl.store(diag_ptr + 16, 16)   # 步进：已过守卫
     q_start_c = tl.minimum(tl.maximum(q_start, 0), tl.maximum(total_tokens - 1, 0))
     if q_start != q_start_c:
         tl.store(diag_ptr + 8, 1)
@@ -144,6 +145,7 @@ def _spec_attn_partial(
     m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
     acc = tl.zeros([BLOCK_M, D], tl.float32)
+    tl.store(diag_ptr + 17, 17)   # 步进：q 已加载
     qs = (q * scale).to(tl.bfloat16)
 
     for t in range(t0, t1):
@@ -180,8 +182,10 @@ def _spec_attn_partial(
         else:
             # Unquantized cache: load verbatim (no conversion) so the bf16 fast path is
             # byte-for-byte what it was before the fp8 support was added.
+            tl.store(diag_ptr + 18, 18)   # 步进：已进入 KV 循环
             k = tl.load(k_ptrs, mask=k_ok[:, None], other=0.0)
             v = tl.load(v_ptrs, mask=k_ok[:, None], other=0.0)
+        tl.store(diag_ptr + 19, 19)   # 步进：k/v 已加载
         s = tl.dot(qs, tl.trans(k)).to(tl.float32)            # [BLOCK_M, TILE]
         allowed = k_ok[None, :] & (pos[None, :] <= q_pos[:, None]) & row_ok[:, None]
         s = tl.where(allowed, s, float("-inf"))
@@ -193,12 +197,14 @@ def _spec_attn_partial(
         acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v).to(tl.float32)
         m_i = m_new
 
+    tl.store(diag_ptr + 20, 20)   # 步进：注意力循环结束
     # store partials at flat index ((req*Hq + head)*QMAX + i)*NSEG + seg
     hrow = kvh * G + rg
     pidx = ((req * Hq + hrow) * QMAX + ri) * NSEG + seg
     tl.store(part_o_ptr + pidx[:, None] * D + d[None, :], acc, mask=row_ok[:, None])
     tl.store(part_m_ptr + pidx, m_i, mask=row_ok)
     tl.store(part_l_ptr + pidx, l_i, mask=row_ok)
+    tl.store(diag_ptr + 21, 21)   # 步进：partial 已写出（本内核完成）
 
 
 @triton.jit
@@ -310,7 +316,7 @@ class SpecDecodeAttention:
         _buf, _stride, _has = get_diag_buffer()
         # Record the kernel's own guard hits in host-mapped memory: a device-side
         # diag dies with the CUDA context, which is exactly when it is needed.
-        diag_ptr = _buf[ATTN_DIAG_OFF : ATTN_DIAG_OFF + 16] if _has else self.diag
+        diag_ptr = _buf[ATTN_DIAG_OFF : ATTN_DIAG_OFF + 48] if _has else self.diag
         Hq, D = q.shape[1], q.shape[2]
         Hkv = key_cache.shape[2]
         G = Hq // Hkv
