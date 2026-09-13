@@ -16,8 +16,10 @@ import sys
 import time
 import urllib.request
 
-URL = "http://127.0.0.1:8098/v1/completions"
-MODEL = "dsv4s"
+import os
+
+URL = os.environ.get("BENCH_URL", "http://127.0.0.1:8098/v1/completions")
+MODEL = os.environ.get("BENCH_MODEL", "dsv4s")
 N_DECODE = 192
 
 WORDS = (

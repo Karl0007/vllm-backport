@@ -115,7 +115,11 @@ case "$SPEC" in
   # (the recipe's note); greedy stays correct for temperature 0.
   mtp) SPEC_ARGS=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":$NUM_SPEC${DRAFT_SAMPLE:+,\"draft_sample_method\":\"$DRAFT_SAMPLE\"}}") ;;
   dflash) SPEC_ARGS=(--speculative-config "{\"method\":\"dflash\",\"model\":\"/models/$(basename "$DRAFT")\",\"num_speculative_tokens\":$NUM_SPEC${DRAFT_SAMPLE:+,\"draft_sample_method\":\"$DRAFT_SAMPLE\"}}") ;;
-  *) echo "SPEC must be none|mtp|dflash, got $SPEC" >&2; exit 1 ;;
+  # dspark: a standalone draft checkpoint (DSparkDraftModel), same shape of
+  # argument as dflash but its own method name (vllm/config/speculative.py:
+  # DSparkModelTypes = Literal["dspark"]).
+  dspark) SPEC_ARGS=(--speculative-config "{\"method\":\"dspark\",\"model\":\"/models/$(basename "$DRAFT")\",\"num_speculative_tokens\":$NUM_SPEC${DRAFT_SAMPLE:+,\"draft_sample_method\":\"$DRAFT_SAMPLE\"}}") ;;
+  *) echo "SPEC must be none|mtp|dflash|dspark, got $SPEC" >&2; exit 1 ;;
 esac
 
 mkdir -p "$CACHE_DIR/vllm" "$CACHE_DIR/triton" "$CACHE_DIR/inductor"
