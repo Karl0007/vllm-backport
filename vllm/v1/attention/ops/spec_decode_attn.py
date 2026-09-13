@@ -261,6 +261,17 @@ class SpecDecodeAttention:
         from vllm.v1.worker.mamba_utils import diag_mark, get_diag_buffer
 
         diag_mark(out, 3000 + 4)
+        import logging as _lg
+
+        _lg.getLogger("vllm.mamba").warning(
+            "HOOK_ARGS reqs=%d q=%d qmax=%d q_shape=%s cu=%s seqused=%s bt=%s bt_stride=%d "
+            "kblk=%d ksz=%d qstride=%s max_reqs=%d capturing=%s",
+            num_reqs, max_query_len, self.qmax, tuple(q.shape),
+            tuple(cu_seqlens_q.shape), tuple(seqused_k.shape), tuple(block_table.shape),
+            block_table.stride(0), key_cache.shape[0], key_cache.shape[1],
+            (q.stride(0), q.stride(1)), self.max_num_reqs,
+            torch.cuda.is_current_stream_capturing(),
+        )
         # Unique sentinel: scanning the whole capture buffer for it proves whether this
         # Python body ever ran (graph capture vs replay), independent of any offset math.
         from vllm.v1.worker.mamba_utils import diag_py as _sentinel
