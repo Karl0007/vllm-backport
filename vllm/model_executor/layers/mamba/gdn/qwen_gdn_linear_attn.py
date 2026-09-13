@@ -1314,6 +1314,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         non_spec_token_indx = attn_metadata.non_spec_token_indx
         spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
+        # Diagnostic: a state index outside the pool (or negative) indexes the state
+        # cache far below its base -- the consumers only exclude the null id. 4096 is a
+        # deliberately loose upper bound (the pool is ~188 blocks).
+        from vllm.v1.worker.mamba_utils import diag_scan as _ds
+
+        _ds(spec_state_indices_tensor, spec_state_indices_tensor, 6, -1, 4096)
+        _ds(non_spec_state_indices_tensor, non_spec_state_indices_tensor, 7, -1, 4096)
         self_kv_cache = self.kv_cache
         # conv_state must be (..., dim, width-1) for the conv kernels.
         # DS layout stores it that way directly; SD layout needs a transpose.
