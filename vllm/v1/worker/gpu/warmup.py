@@ -201,7 +201,13 @@ def run_mixed_prefill_decode_warmup(
         worker_execute_model(decode_prefill_output)
         worker_sample_tokens(None)
         with context:
-            worker_execute_model(mixed_output)
+            import os as _o
+
+            if _o.environ.get("VLLM_SKIP_MIXED_WARMUP", "0") != "1":
+                # Diagnostic/workaround: with a quantized KV cache plus speculative
+                # decoding the mixed batch trips FlashInfer's q vs qo_indptr check
+                # (q=16 rows, qo_indptr[-1]=8). Skipping it costs one JIT compile later.
+                worker_execute_model(mixed_output)
             worker_sample_tokens(None)
         worker_execute_model(cleanup_output)
     finally:
@@ -235,6 +241,15 @@ def _warmup_kernels(
     worker_execute_model: Callable[[SchedulerOutput], Any],
     worker_sample_tokens: Callable[[GrammarOutput | None], Any],
 ) -> None:
+    import os as _o
+
+    if _o.environ.get("VLLM_SKIP_WARMUP", "0") == "1":
+        # Workaround for quantized KV + speculation: the warmup's multi-request
+        # spec-decode step is routed through FlashInfer's paged-prefill API with a
+        # query covering both requests while qo_indptr covers one (q=16 vs 8), which
+        # aborts startup. The warmup only pre-compiles kernels; skipping it costs a
+        # JIT compile later.
+        return
     if model_runner.vllm_config.is_mm_encoder_only:
         return
 
@@ -432,6 +447,14 @@ def _warmup_kernels(
         elif use_spec_decode:
             decode_steps.append(([0], [False]))
 
+        import os as _o
+
+        if _o.environ.get("VLLM_WARMUP_SINGLE_REQ", "0") == "1":
+            # Workaround: with a quantized KV cache plus speculative decoding the
+            # multi-request decode steps hand FlashInfer a query covering every request
+            # while its qo_indptr covers one (q=16 vs qo_indptr[-1]=8), which aborts
+            # startup. Single-request steps still warm the same kernels.
+            decode_steps = [st for st in decode_steps if len(st[0]) == 1] or decode_steps[:1]
         for step_indices, step_spec_flags in decode_steps:
             _run_decode_step(step_indices, step_spec_flags)
 

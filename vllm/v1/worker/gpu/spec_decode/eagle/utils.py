@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
+import logging
+import os
+
 import torch
 import torch.nn as nn
 
@@ -8,6 +12,72 @@ from vllm.distributed.parallel_state import get_pp_group
 from vllm.lora.layers.base import BaseLayerWithLoRA
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models.utils import PPMissingLayer
+
+logger = logging.getLogger(__name__)
+
+# Candidate checkpoint keys for the token embedding, most specific first.
+# GLM5-Next multimodal checkpoints prefix the text tower weights.
+_EMBED_KEYS = (
+    "model.language_model.embed_tokens.weight",
+    "model.embed_tokens.weight",
+    "model.embed.weight",
+    "embed_tokens.weight",
+)
+
+
+def _has_real_weight(module) -> bool:
+    """True for a materialised layer; False for PPMissingLayer / None.
+
+    Under pipeline parallelism vLLM replaces the layers a rank does not own with
+    PPMissingLayer, which has no ``weight``. Aliasing one of those into the draft
+    silently produces a no-op layer rather than an error, so check explicitly.
+    """
+    return module is not None and getattr(module, "weight", None) is not None
+
+
+def _load_embed_from_checkpoint(embed: nn.Module, model_path: str) -> None:
+    """Fill the draft's own token embedding straight from the checkpoint.
+
+    Only needed under PP: the drafter runs on the LAST pipeline rank, but the
+    target's ``embed_tokens`` lives on the FIRST, so there is nothing local to
+    alias. The MTP ``load_weights()`` only consumes spec-layer tensors (the
+    top-level ``embed_tokens`` key is skipped by the spec-layer filter), so the
+    draft's own embedding would otherwise stay uninitialised memory -- the draft
+    then emits constant garbage tokens (acceptance ~= 1). Reading the one tensor
+    off disk avoids adding a cross-rank collective. Mirrors the dspark+PP fix.
+    """
+    from safetensors import safe_open
+
+    model_path = os.path.expanduser(model_path)
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    key = shard = None
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+        for cand in _EMBED_KEYS:
+            if cand in weight_map:
+                key, shard = cand, os.path.join(model_path, weight_map[cand])
+                break
+    if key is None:
+        raise RuntimeError(
+            f"PP spec-decode: could not find a token-embedding tensor in "
+            f"{index_path}; looked for {_EMBED_KEYS}. The draft needs its own "
+            "copy because the target's embedding lives on PP rank 0."
+        )
+
+    with safe_open(shard, framework="pt") as f:
+        w = f.get_tensor(key)
+    with torch.no_grad():
+        # VocabParallelEmbedding pads the vocab dimension, so copy into the
+        # leading rows rather than assigning the whole tensor.
+        embed.weight.data[: w.shape[0]].copy_(
+            w.to(dtype=embed.weight.dtype, device=embed.weight.device)
+        )
+    logger.info(
+        "PP spec-decode: loaded draft token embedding %s from key %r",
+        tuple(w.shape),
+        key,
+    )
 
 
 def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
@@ -131,6 +201,19 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
     draft_inner = eagle_model.model
 
     maybe_share_target_embed(eagle_model, draft_inner, target_inner)
+    # PP: the target's embedding is a PPMissingLayer on this stage, so the
+    # drafter keeps its own module and must fill it from the checkpoint -- the
+    # MTP load_weights() drops every non-spec-layer key, so a draft-owned
+    # embed_tokens would otherwise stay uninitialised and the draft would emit
+    # constant garbage tokens (acceptance ~= 1, corrupt output).
+    if get_pp_group().world_size != 1:
+        target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
+            target_inner, "embedding", None
+        )
+        draft_embed = getattr(draft_inner, "embed_tokens", None)
+        if draft_embed is not None and not _has_real_weight(target_embed):
+            _load_embed_from_checkpoint(draft_embed, draft_model_config.model)
+
 
     target_lm_head = get_target_lm_head(target_model, target_language_model)
     draft_lm_head = getattr(eagle_model, "lm_head", None)

@@ -12,6 +12,39 @@
 # align-mode seed divisor was upstream-carried because the file cites
 # vllm#53142, and that single wrong entry cost a production-line Xid 13.
 #
+# known gap (deliberately not carried on this line):
+#   - csrc/libtorch_stable alignment traps on raw float4/float2 casts
+#     (083b4aeab2, on the compile line only). This image is a prebuilt sm80
+#     wheel plus a pure-Python overlay, so csrc/ C++ is never compiled here and
+#     carrying the diff would change nothing. Trigger to revisit: a misaligned
+#     address Xid 13 reappearing on this line.
+
+# known gap (deliberately not carried on this line):
+#   - csrc/libtorch_stable alignment traps on raw float4/float2 casts
+#     (083b4aeab2, compile line only). This image is a prebuilt sm80 wheel plus a
+#     pure-Python overlay, so csrc/ C++ is never compiled here and carrying the diff
+#     would change nothing. Trigger to revisit: a misaligned-address Xid 13
+#     reappearing on this line.
+#
+# deliberately not re-ported as code (kept as a note only):
+#   - vllm#48375 extra KV-cache block drop. It was carried on the x99 line until
+#     2026-09-12 and then removed: on this base upstream's get_replay_boundaries
+#     (#53945/#54713) already retains the checkpoint at the post-drop candidate, so
+#     the extra drop zeroed resends -- a prefix-cache resend became a zero-token hit.
+#     Symptom when carried: with speculative decoding, CUDA graphs and a prefix-cache
+#     hit, the resumed mamba/GDN state pointed the verify attention outside every live
+#     buffer and faulted the GPU (Xid 31, ~1227 blocks below the KV cache base).
+#     Nothing to patch here: the fix is the *absence* of that block drop.
+#
+# env switches introduced by the split-KV port (all default off):
+#   - VLLM_SPEC_DECODE_ATTN=1        enable the split-KV verify kernel on the FA2
+#                                    backend (default "0"; profile sets SPEC_ATTN=1)
+#   - VLLM_SPEC_DECODE_ATTN_QMAX=N   cap query tokens per request (default 0 = derive
+#                                    from the model's spec config)
+#   Cost note: the split-KV hook is +12% decode on the FA2 path (117.5 vs 105.0
+#   aggregate, decode3). The short-context -26% seen on x99 comes from the fp8 KV
+#   profile switching the backend to FlashInfer (97.6), NOT from this hook.
+
 # carried upstream (no local patch needed):
 #   - PR #63 PP+MTP+prefix-cache mamba state corruption: align copy kernels
 #     index rows by req_idx (mamba_utils.py) + runner binds ctx to the SOURCE
@@ -88,6 +121,21 @@ COPY vllm/models/qwen4_exp/nvidia/ngram_embedding.py /tmp/vllm_patch/ngram_embed
 # (upstream #54793, unmerged): without it hybrid PP dies with a bare
 # StopIteration in allocate_kv_cache during KV init.
 COPY vllm/v1/core/kv_cache_utils.py /tmp/vllm_patch/kv_cache_utils.py
+# split-KV spec-decode port (x99 line): one COPY per registered file, stage name
+# prefixed to avoid basename collisions in the flat stage dir.
+COPY vllm/v1/attention/ops/spec_decode_attn.py /tmp/vllm_patch/spec_decode_attn.py
+COPY vllm/v1/attention/backends/flash_attn.py /tmp/vllm_patch/flash_attn_be.py
+COPY vllm/v1/attention/backends/flashinfer.py /tmp/vllm_patch/flashinfer_be.py
+COPY vllm/v1/engine/core.py /tmp/vllm_patch/engine_core.py
+COPY vllm/v1/core/sched/interface.py /tmp/vllm_patch/sched_interface.py
+COPY vllm/v1/core/sched/scheduler.py /tmp/vllm_patch/sched_scheduler.py
+COPY vllm/v1/worker/gpu/spec_decode/eagle/utils.py /tmp/vllm_patch/eagle_utils.py
+COPY vllm/v1/sample/rejection_sampler.py /tmp/vllm_patch/reject_sampler.py
+COPY vllm/v1/worker/gpu/warmup.py /tmp/vllm_patch/warmup.py
+COPY vllm/model_executor/models/qwen3_dflash.py /tmp/vllm_patch/qwen_dflash.py
+COPY vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py /tmp/vllm_patch/qwen_gdn_attn.py
+COPY vllm/model_executor/models/qwen3_5.py /tmp/vllm_patch/qwen3_5.py
+COPY vllm/model_executor/models/qwen3_5_mtp.py /tmp/vllm_patch/qwen3_5_mtp.py
 COPY deploy/apply-vllm-patches.py /tmp/vllm_patch/apply-vllm-patches.py
 RUN python3 /tmp/vllm_patch/apply-vllm-patches.py /tmp/vllm_patch
 

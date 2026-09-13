@@ -25,6 +25,26 @@ PATCHES = {
     "kv_cache_utils.py": "v1/core/kv_cache_utils.py",
 }
 
+# Split-KV spec-decode port (x99 line). Same rule as above: explicit list, one
+# semantic REQUIRED entry per file below, no whole-tree copy. Stage names carry a
+# prefix because several of these files share a basename with an upstream module
+# (core.py, utils.py, scheduler.py, interface.py) and the stage dir is flat.
+PATCHES.update({
+    "spec_decode_attn.py": "v1/attention/ops/spec_decode_attn.py",
+    "flash_attn_be.py": "v1/attention/backends/flash_attn.py",
+    "flashinfer_be.py": "v1/attention/backends/flashinfer.py",
+    "engine_core.py": "v1/engine/core.py",
+    "sched_interface.py": "v1/core/sched/interface.py",
+    "sched_scheduler.py": "v1/core/sched/scheduler.py",
+    "eagle_utils.py": "v1/worker/gpu/spec_decode/eagle/utils.py",
+    "reject_sampler.py": "v1/sample/rejection_sampler.py",
+    "warmup.py": "v1/worker/gpu/warmup.py",
+    "qwen_dflash.py": "model_executor/models/qwen3_dflash.py",
+    "qwen_gdn_attn.py": "model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
+    "qwen3_5.py": "model_executor/models/qwen3_5.py",
+    "qwen3_5_mtp.py": "model_executor/models/qwen3_5_mtp.py",
+})
+
 REQUIRED = (
     (
         "v1/worker/gpu/model_states/mamba_hybrid.py",
@@ -52,6 +72,44 @@ REQUIRED = (
         "v1/core/kv_cache_utils.py",
         "use_trailing_layer_fallback=_uses_trailing_mtp_layers(vllm_config)",
         "MTP draft KV groups are unannotated again (flag-all disables prefix reuse)",
+    ),
+    # --- split-KV spec-decode port -------------------------------------------------
+    (
+        "v1/attention/ops/spec_decode_attn.py",
+        "k_lim = nblocks * stride_kb",
+        "composed KV-gather address is unbounded again: a stale-but-consistent "
+        "parameter set walks out of the cache (Xid 31)",
+    ),
+    (
+        "v1/attention/ops/spec_decode_attn.py",
+        "_spec_attn_partial[grid]",
+        "split-KV verify kernel missing",
+    ),
+    (
+        "v1/attention/backends/flash_attn.py",
+        "def _spec_attn_run(",
+        "FA2 backend no longer routes multi-token verify through the split-KV hook",
+    ),
+    (
+        "v1/attention/backends/flashinfer.py",
+        "prefill_real_tokens",
+        "FlashInfer q/qo_indptr mismatch is back: fp8 KV plus speculation dies at "
+        "startup with 'q.shape[0] (16) does not match qo_indptr[-1] (8)'",
+    ),
+    (
+        "v1/engine/core.py",
+        "SchedulerOutput",
+        "engine core wiring for the split-KV port missing",
+    ),
+    (
+        "v1/sample/rejection_sampler.py",
+        "num_draft_tokens",
+        "rejection sampler wiring for the split-KV port missing",
+    ),
+    (
+        "v1/worker/gpu/spec_decode/eagle/utils.py",
+        "PPMissingLayer",
+        "draft embed lookup aliases a missing layer instead of skipping it",
     ),
 )
 

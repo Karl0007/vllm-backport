@@ -173,3 +173,43 @@ forbid(
 )
 
 print("overlay assertions OK")
+
+# ---------------------------------------------------------------------------
+# split-KV spec-decode port (x99 line). One semantic marker per registered file:
+# a string that can only be present when the fix itself is present, never a name.
+# ---------------------------------------------------------------------------
+spec_attn = read("v1", "attention", "ops", "spec_decode_attn.py")
+require(
+    spec_attn,
+    "k_lim = nblocks * stride_kb",
+    "composed KV-gather address is unbounded again: a consistent-but-stale parameter "
+    "set walks out of the cache (Xid 31, negative offset)",
+)
+require(
+    spec_attn,
+    "g_ok = k_pos[:, None] & (k_off >= 0) & (k_off < k_lim)",
+    "KV gather lost its composed-offset mask",
+)
+require_count(
+    spec_attn,
+    "_spec_attn_partial[grid]",
+    1,
+    "split-KV verify kernel launch missing or duplicated",
+)
+
+fa2 = read("v1", "attention", "backends", "flash_attn.py")
+require(fa2, "def _spec_attn_run(", "FA2 backend lost the split-KV verify entry point")
+require(fa2, "VLLM_SPEC_DECODE_ATTN", "split-KV env switch gone (now unconditional or dead)")
+
+fi = read("v1", "attention", "backends", "flashinfer.py")
+require(
+    fi,
+    "prefill_real_tokens",
+    "FlashInfer q/qo_indptr mismatch is back: fp8 KV plus speculation dies at startup",
+)
+
+eagle = read("v1", "worker", "gpu", "spec_decode", "eagle", "utils.py")
+require(eagle, "PPMissingLayer", "draft embed lookup aliases a missing layer again")
+
+rs = read("v1", "sample", "rejection_sampler.py")
+require(rs, "num_draft_tokens", "rejection sampler lost its spec-decode path")

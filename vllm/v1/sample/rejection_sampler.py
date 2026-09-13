@@ -739,6 +739,16 @@ def rejection_greedy_sample_kernel(
     )
     end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)
     num_draft_tokens = end_idx - start_idx
+    if num_draft_tokens < 0 or num_draft_tokens > max_spec_len:
+        # cu_num_draft_tokens is a persistent buffer: a captured graph replays with a
+        # stale tail when the live batch is smaller. Bound by construction before any
+        # indexing (diagnostic print; the guard is the fix shape).
+        tl.device_print("REJ_BAD req=", req_idx)
+        tl.device_print("REJ_BAD n_draft=", num_draft_tokens)
+        tl.device_print("REJ_BAD max_spec_len=", max_spec_len)
+        tl.device_print("REJ_BAD start=", start_idx)
+        tl.device_print("REJ_BAD end=", end_idx)
+        return
 
     rejected = False
     for pos in range(num_draft_tokens):
@@ -800,6 +810,16 @@ def rejection_random_sample_kernel(
     )
     end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)
     num_draft_tokens = end_idx - start_idx
+    if num_draft_tokens < 0 or num_draft_tokens > max_spec_len:
+        # cu_num_draft_tokens is a persistent buffer: a captured graph replays with a
+        # stale tail when the live batch is smaller. Bound by construction before any
+        # indexing (diagnostic print; the guard is the fix shape).
+        tl.device_print("REJ_BAD req=", req_idx)
+        tl.device_print("REJ_BAD n_draft=", num_draft_tokens)
+        tl.device_print("REJ_BAD max_spec_len=", max_spec_len)
+        tl.device_print("REJ_BAD start=", start_idx)
+        tl.device_print("REJ_BAD end=", end_idx)
+        return
 
     rejected = False
     for pos in range(num_draft_tokens):
@@ -890,6 +910,16 @@ def sample_recovered_tokens_kernel(
     )
     end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)
     num_draft_tokens = end_idx - start_idx
+    if num_draft_tokens < 0 or num_draft_tokens > max_spec_len:
+        # cu_num_draft_tokens is a persistent buffer: a captured graph replays with a
+        # stale tail when the live batch is smaller. Bound by construction before any
+        # indexing (diagnostic print; the guard is the fix shape).
+        tl.device_print("REJ_BAD req=", req_idx)
+        tl.device_print("REJ_BAD n_draft=", num_draft_tokens)
+        tl.device_print("REJ_BAD max_spec_len=", max_spec_len)
+        tl.device_print("REJ_BAD start=", start_idx)
+        tl.device_print("REJ_BAD end=", end_idx)
+        return
 
     # Early exit for out-of-range positions.
     pos = tl.program_id(1)
