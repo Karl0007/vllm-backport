@@ -1260,7 +1260,8 @@ class FlashAttentionImpl(AttentionImpl):
                 if (
                     _spec_attn_enabled()
                     and 1 < max_seqlen_q <= _spec_attn_qmax(self)
-                    and not is_quantized_kv_cache(self.kv_cache_dtype)
+                    # fp8/int8 KV is supported: the kernel dequantizes on load with the
+                    # layer's scales (added 2026-09-13).
                     and (
                         sliding_window_size is None
                         or (sliding_window_size[0] < 0 and sliding_window_size[1] < 0)
@@ -1284,6 +1285,8 @@ class FlashAttentionImpl(AttentionImpl):
                         block_table,
                         attn_metadata.num_reqs or (cu_seqlens_q.shape[0] - 1),
                         max_seqlen_q,
+                        k_scale=layer._k_scale_float,
+                        v_scale=layer._v_scale_float,
                     ):
                         return output
 
@@ -2034,7 +2037,7 @@ def _spec_attn_qmax(impl) -> int:
 
 
 def _spec_attn_run(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k,
-                   block_table, num_reqs, max_query_len):
+                   block_table, num_reqs, max_query_len, k_scale=1.0, v_scale=1.0):
     """Returns True when the kernel ran, False when the batch must fall back to FA2."""
     from vllm.v1.attention.ops.spec_decode_attn import SpecDecodeAttention
 
@@ -2117,7 +2120,7 @@ def _spec_attn_run(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k
         return False
     att.run(
         q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table,
-        impl.scale, num_reqs, max_query_len,
+        impl.scale, num_reqs, max_query_len, k_scale, v_scale,
     )
     return True
 

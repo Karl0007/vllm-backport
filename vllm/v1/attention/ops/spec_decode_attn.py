@@ -41,6 +41,7 @@ def _spec_attn_partial(
     q_ptr, k_ptr, v_ptr, bt_ptr, seqused_ptr, cu_q_ptr, total_tokens, nblocks, diag_ptr,
     part_o_ptr, part_m_ptr, part_l_ptr,
     scale,
+    k_scale, v_scale,
     stride_qt, stride_qh,
     stride_kb, stride_ks, stride_kh,
     stride_vb, stride_vs, stride_vh,
@@ -154,8 +155,10 @@ def _spec_attn_partial(
         slot = pos % BLOCK_SIZE
         k_ptrs = k_ptr + blk[:, None] * stride_kb + slot[:, None] * stride_ks + kvh * stride_kh + d[None, :]
         v_ptrs = v_ptr + blk[:, None] * stride_vb + slot[:, None] * stride_vs + kvh * stride_vh + d[None, :]
-        k = tl.load(k_ptrs, mask=k_ok[:, None], other=0.0)
-        v = tl.load(v_ptrs, mask=k_ok[:, None], other=0.0)
+        # fp8 KV: the cache holds x / scale, so multiply back (scale is 1.0 for bf16,
+        # making this a no-op). The kernel previously only ran on non-quantized KV.
+        k = tl.load(k_ptrs, mask=k_ok[:, None], other=0.0).to(tl.float32) * k_scale
+        v = tl.load(v_ptrs, mask=k_ok[:, None], other=0.0).to(tl.float32) * v_scale
         s = tl.dot(qs, tl.trans(k)).to(tl.float32)            # [BLOCK_M, TILE]
         allowed = k_ok[None, :] & (pos[None, :] <= q_pos[:, None]) & row_ok[:, None]
         s = tl.where(allowed, s, float("-inf"))
@@ -260,7 +263,8 @@ class SpecDecodeAttention:
         qt = max(1, block_m // G)
         return block_m, qt, triton.cdiv(q_len, qt), 8 if block_m >= 128 else 4
 
-    def run(self, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table, scale, num_reqs, max_query_len):
+    def run(self, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table,
+            scale, num_reqs, max_query_len, k_scale=1.0, v_scale=1.0):
         from vllm.v1.worker.mamba_utils import diag_mark, get_diag_buffer
 
         diag_mark(out, 3000 + 4)
@@ -353,6 +357,7 @@ class SpecDecodeAttention:
             q.shape[0], key_cache.shape[0], self.diag,
             self.part_o, self.part_m, self.part_l,
             scale,
+            k_scale, v_scale,
             q.stride(0), q.stride(1),
             key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
             value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
