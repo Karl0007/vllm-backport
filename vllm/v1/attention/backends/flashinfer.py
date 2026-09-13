@@ -672,6 +672,11 @@ class FlashInferMetadata:
     """
 
     cascade_wrapper: MultiLevelCascadeAttentionWrapper | None
+    # GPU query offsets (query_start_loc) so the split-KV spec-decode hook can build
+    # its cu_seqlens without re-deriving them (added 2026-09-13).
+    qo_indptr_gpu: torch.Tensor | None = None
+    seq_lens_gpu: torch.Tensor | None = None
+    block_table_gpu: torch.Tensor | None = None
     # Real (unpadded) prefill token count, derived from the prefill qo_indptr. The
     # runner pads num_actual_tokens for CUDA-graph capture, so num_prefill_tokens can
     # exceed what the paged-prefill plan covers; slicing the query by this keeps the
@@ -1405,6 +1410,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             prefill_real_tokens=real_total_tokens,
+            qo_indptr_gpu=qo_indptr,
+            seq_lens_gpu=seq_lens,
+            block_table_gpu=block_table_tensor,
             causal=causal,
             use_cascade=use_cascade,
             prefill=None,
@@ -1827,6 +1835,13 @@ class FlashInferImpl(AttentionImpl):
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
         self.alibi_slopes = alibi_slopes
+        # Split-KV spec-decode hook knobs (mirrors the FA2 backend).
+        _cfg = get_current_vllm_config_or_none()
+        _spec_cfg = _cfg.speculative_config if _cfg is not None else None
+        self.spec_attn_max_reqs = _cfg.scheduler_config.max_num_seqs if _cfg is not None else 0
+        self.spec_attn_qmax = 1 + (
+            int(_spec_cfg.num_speculative_tokens) if _spec_cfg is not None else 0
+        )
         if sliding_window is None:
             self.sliding_window = (-1, -1)
         else:
@@ -2166,6 +2181,58 @@ class FlashInferImpl(AttentionImpl):
                 real_prefill = num_prefill_tokens
             prefill_query = query[num_decode_tokens : num_decode_tokens + real_prefill]
             assert prefill_query.shape[0] == real_prefill <= num_prefill_tokens
+
+            # Split-KV spec-decode hook: the same Triton kernel the FA2 backend uses,
+            # driven from this backend so fp8 KV (which forces FlashInfer on sm80) can
+            # still use it. Declines (returns False) when its preconditions do not hold,
+            # in which case the regular FlashInfer prefill below runs unchanged.
+            from vllm.v1.attention.backends.flash_attn import (
+                _spec_attn_enabled,
+                _spec_attn_qmax,
+                _spec_attn_run,
+            )
+
+            import os as _ho
+
+            if (
+                # Off by default: the fp8 path still faults (uint8-view strides need
+                # work), so this stays behind its own switch until it is validated.
+                _ho.environ.get("VLLM_SPEC_ATTN_FLASHINFER", "0") == "1"
+                and _spec_attn_enabled()
+                and attn_metadata.qo_indptr_gpu is not None
+                and attn_metadata.num_prefills > 0
+                and attn_metadata.causal is True
+                and self.sliding_window == (-1, -1)
+                and getattr(self, "sinks", None) is None
+                and self.alibi_slopes is None
+            ):
+                _max_q = max(1, real_prefill // attn_metadata.num_prefills)
+                if 1 < _max_q <= _spec_attn_qmax(self):
+                    _indptr = attn_metadata.qo_indptr_gpu
+                    _nd = attn_metadata.num_decodes
+                    _np = attn_metadata.num_prefills
+                    _cu = _indptr[_nd : _nd + _np + 1] - _indptr[_nd]
+                    _k, _v = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+                    if _k.dtype != attn_metadata.q_data_type_decode:
+                        # Quantized KV: hand the kernel raw bytes (sm80 Triton cannot
+                        # load float8e4nv; the kernel decodes e4m3 itself).
+                        _k = _k.view(torch.uint8)
+                        _v = _v.view(torch.uint8)
+                    if _spec_attn_run(
+                        self,
+                        prefill_query,
+                        _k,
+                        _v,
+                        output[num_decode_tokens : num_decode_tokens + real_prefill],
+                        _cu,
+                        attn_metadata.seq_lens_gpu[_nd : _nd + _np],
+                        attn_metadata.block_table_gpu[_nd : _nd + _np],
+                        _np,
+                        _max_q,
+                        k_scale=layer._k_scale_float,
+                        v_scale=layer._v_scale_float,
+                    ):
+                        return output
 
             # Convert query to the expected dtype for prefill if needed.
             prefill_query = self.maybe_quant_query(

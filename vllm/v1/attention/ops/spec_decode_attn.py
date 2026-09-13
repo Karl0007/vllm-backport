@@ -37,6 +37,19 @@ QMAX_TOKENS = 64   # query tokens per request the caller may ask for
 
 
 @triton.jit
+def _e4m3_to_fp32(b):
+    """Decode E4M3 bytes (as uint8) to fp32: sign|exp(4, bias 7)|mantissa(3)."""
+    b = b.to(tl.int32)
+    sign = tl.where((b & 0x80) != 0, -1.0, 1.0)
+    exp = (b >> 3) & 0xF
+    mant = b & 0x7
+    mant_f = mant.to(tl.float32)
+    normal = sign * tl.exp2(exp.to(tl.float32) - 7.0) * (1.0 + mant_f / 8.0)
+    subnormal = sign * (mant_f / 8.0) * tl.exp2(-6.0)
+    return tl.where(exp == 0, subnormal, normal)
+
+
+@triton.jit
 def _spec_attn_partial(
     q_ptr, k_ptr, v_ptr, bt_ptr, seqused_ptr, cu_q_ptr, total_tokens, nblocks, diag_ptr,
     part_o_ptr, part_m_ptr, part_l_ptr,
@@ -47,6 +60,7 @@ def _spec_attn_partial(
     stride_vb, stride_vs, stride_vh,
     stride_bt,
     G: tl.constexpr, Hq: tl.constexpr, QMAX: tl.constexpr, D: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+    KV_FP8: tl.constexpr,
     MAX_REQS: tl.constexpr,
     BLOCK_M: tl.constexpr, TILE: tl.constexpr, NSEG: tl.constexpr, QT: tl.constexpr,
     NTILE: tl.constexpr,
@@ -155,10 +169,17 @@ def _spec_attn_partial(
         slot = pos % BLOCK_SIZE
         k_ptrs = k_ptr + blk[:, None] * stride_kb + slot[:, None] * stride_ks + kvh * stride_kh + d[None, :]
         v_ptrs = v_ptr + blk[:, None] * stride_vb + slot[:, None] * stride_vs + kvh * stride_vh + d[None, :]
-        # fp8 KV: the cache holds x / scale, so multiply back (scale is 1.0 for bf16,
-        # making this a no-op). The kernel previously only ran on non-quantized KV.
-        k = tl.load(k_ptrs, mask=k_ok[:, None], other=0.0).to(tl.float32) * k_scale
-        v = tl.load(v_ptrs, mask=k_ok[:, None], other=0.0).to(tl.float32) * v_scale
+        if KV_FP8:
+            # sm80's Triton cannot load float8e4nv, so read the raw bytes and decode
+            # e4m3 in software: sign(1) | exp(4) | mantissa(3), bias 7.
+            kb = tl.load(k_ptrs, mask=k_ok[:, None], other=0).to(tl.uint8)
+            vb = tl.load(v_ptrs, mask=k_ok[:, None], other=0).to(tl.uint8)
+            k = (_e4m3_to_fp32(kb) * k_scale).to(tl.bfloat16)
+            v = (_e4m3_to_fp32(vb) * v_scale).to(tl.bfloat16)
+        else:
+            # fp8/int8 stores x / scale, so multiply back (scale is 1.0 for bf16).
+            k = tl.load(k_ptrs, mask=k_ok[:, None], other=0.0).to(tl.float32) * k_scale
+            v = tl.load(v_ptrs, mask=k_ok[:, None], other=0.0).to(tl.float32) * v_scale
         s = tl.dot(qs, tl.trans(k)).to(tl.float32)            # [BLOCK_M, TILE]
         allowed = k_ok[None, :] & (pos[None, :] <= q_pos[:, None]) & row_ok[:, None]
         s = tl.where(allowed, s, float("-inf"))
@@ -363,6 +384,7 @@ class SpecDecodeAttention:
             value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
             block_table.stride(0),
             G=G, Hq=Hq, QMAX=self.qmax, D=D, BLOCK_SIZE=key_cache.shape[1], BLOCK_M=block_m,
+            KV_FP8=key_cache.dtype == torch.uint8,
             MAX_REQS=self.max_num_reqs,
             TILE=tile, NSEG=self.nseg, QT=qt, NTILE=ntile,
             num_warps=warps, num_stages=1,

@@ -876,3 +876,14 @@
 #   同一内核 ✓（**fp8 dequant 已在本轮加好** ✓✓：加载 fp8 后 `* k_scale/v_scale` ✓，
 #   调用方传 `layer._k_scale_float/_v_scale_float` ✓，gate 已放开 ✓）
 #   预期：2.4K 回到 ~160 ✓✓ + 126K ~56 ✓ + 容量 603K ✓✓
+
+# 【2026-09-13 FlashInfer 侧钩子：已实现但默认关闭 ✗（有界残留 ✓）】
+# 为拿回"fp8 容量 + 钩子速度"两全，把钩子接进 FlashInfer 的 prefill 路径 ✗：
+#   已做 ✓：metadata 存 qo_indptr/seq_lens/block_table（GPU ✓）；impl 补 spec_attn_qmax ✓；
+#          gate 放开量化 KV ✓；内核加 **e4m3 软件解码** ✓（sm80 Triton 不支持 fp8e4nv ✗，
+#          故按 uint8 加载 + 位运算解码 ✓，输出转 bf16 以匹配 tl.dot ✓）
+#   卡点 ✗：fp8 视图（`.view(torch.uint8)`）的 **stride 未按字节重算** ✗ ->
+#          内核读到错误偏移 -> **启动即 illegal memory access** ✗✓
+#   => 已用 `VLLM_SPEC_ATTN_FLASHINFER=1` **默认关闭** ✗✓（生产不受影响 ✓ 已重启验证 ✓）
+#   下一步 ✓：把 fp8 视图改为**显式 as_strided**（按字节重算 stride ✗）或让内核接收
+#              "元素字节数"参数 ✗ -> 修好后 2.4K 预期回到 ~160 ✓✓
