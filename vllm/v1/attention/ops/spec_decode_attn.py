@@ -444,7 +444,13 @@ class SpecDecodeAttention:
             block_table.stride(0),
             G=G, Hq=Hq, QMAX=self.qmax, D=D, BLOCK_SIZE=key_cache.shape[1], BLOCK_M=block_m,
             KV_FP8=key_cache.dtype == torch.uint8,
-            D_KV=(D * 2 if key_cache.dtype == torch.uint8 else D),
+            # Per-head extent in the *elements of the pointer's dtype*: the kernel
+            # indexes key_cache with its own strides, so the extent is D for a bf16
+            # cache and D for an fp8 cache viewed as uint8 (one byte per element).
+            # The old `D * 2 if uint8` assumed a bf16 cache reinterpreted as bytes;
+            # against a real fp8 cache it doubled the head extent and walked out of
+            # the block on every tile.
+            D_KV=D,
             MAX_REQS=self.max_num_reqs,
         NO_KV=_os.environ.get("VLLM_SPEC_ATTN_NO_KV", "0") == "1",
             TILE=tile, NSEG=self.nseg, QT=qt, NTILE=ntile,

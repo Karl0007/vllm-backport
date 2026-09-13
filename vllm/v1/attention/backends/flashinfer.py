@@ -598,6 +598,22 @@ class TRTLLMPrefill:
     """The maximum sequence length for KV Cache."""
 
 
+def _fi_hook_enabled() -> bool:
+    """Whether the split-KV spec-decode hook may run on the FlashInfer backend."""
+    import os as _ho
+
+    if _ho.environ.get("VLLM_SPEC_ATTN_FLASHINFER", "0") != "1":
+        return False
+    from vllm.v1.attention.backends.flash_attn import _spec_attn_enabled
+
+    return _spec_attn_enabled()
+
+
+def _fi_hook_qmax(impl) -> int:
+    from vllm.v1.attention.backends.flash_attn import _spec_attn_qmax
+
+    return _spec_attn_qmax(impl)
+
 @dataclass
 class FlashInferTrtllmAPIDecode:
     """Metadata for XQA and trtllm-gen decode."""
@@ -2098,6 +2114,16 @@ class FlashInferImpl(AttentionImpl):
         output_padded = output
         output = output[:num_actual_tokens]
 
+        logger.info_once(
+            "FI attention metadata: decodes=%d decode_tokens=%d prefills=%d "
+            "prefill_tokens=%d use_cascade=%s qo_indptr=%s",
+            attn_metadata.num_decodes,
+            attn_metadata.num_decode_tokens,
+            attn_metadata.num_prefills,
+            attn_metadata.num_prefill_tokens,
+            attn_metadata.use_cascade,
+            attn_metadata.qo_indptr_gpu is not None,
+        )
         if attn_metadata.use_cascade:
             # Cascade attention (rare case).
             assert attn_metadata.cascade_wrapper is not None
@@ -2206,8 +2232,30 @@ class FlashInferImpl(AttentionImpl):
                 and getattr(self, "sinks", None) is None
                 and self.alibi_slopes is None
             ):
-                _max_q = max(1, real_prefill // attn_metadata.num_prefills)
-                if 1 < _max_q <= _spec_attn_qmax(self):
+                # Query tokens per request come from the exact token count, not from
+                # prefill_real_tokens: that one carries CUDA-graph padding, which pushed
+                # _max_q past qmax and silently declined the hook on every step.
+                _max_q = max(
+                    1,
+                    attn_metadata.num_prefill_tokens // attn_metadata.num_prefills,
+                )
+                logger.info_once(
+                    "FI hook gate: enabled=%s qo_indptr=%s prefills=%d causal=%r "
+                    "sw=%r sinks=%r alibi=%r max_q=%d qmax=%d",
+                    _spec_attn_enabled(),
+                    attn_metadata.qo_indptr_gpu is not None,
+                    attn_metadata.num_prefills,
+                    attn_metadata.causal,
+                    self.sliding_window,
+                    getattr(self, "sinks", None) is not None,
+                    self.alibi_slopes is not None,
+                    _max_q,
+                    _fi_hook_qmax(self),
+                )
+                # Upper bound kept: warmup and long prefills ask for far more query
+                # tokens per request than the kernel's buffers hold, and the kernel
+                # asserts on that.
+                if 1 < _max_q <= _fi_hook_qmax(self):
                     _indptr = attn_metadata.qo_indptr_gpu
                     _nd = attn_metadata.num_decodes
                     _np = attn_metadata.num_prefills

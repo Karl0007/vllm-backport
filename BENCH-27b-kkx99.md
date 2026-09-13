@@ -1058,3 +1058,24 @@
 #    -> **故障在 partial 的 KV 收集** ✓✓，**不是索引越界**（守卫全过 ✓）而是**参数陈旧** ✓
 # 修复方向（有界 ✓）：让 partial 的**网格与 stride 每次发射都按活张量重算** ✗
 #    （或把 KV 维度改为**设备端可读的张量** ✓），使发射参数与重放期布局一致 ✓。
+
+# 【2026-09-13 fp8+FlashInfer+钩子：接通 ✓ 但**是负优化** ✗】
+# 接通过程（四个真实障碍，逐个定位 ✓）：
+#  ① 最初把钩子挂在 FI 的 *prefill* 分支 ✓ —— 但当时被我自己加的 `_max_q` 预检查拒绝 ✗：
+#     `real_prefill // num_prefills` 含 CUDA-graph padding ✓ -> max_q 超 qmax -> 静默放弃 ✗
+#     修正：改用**精确**的 `num_prefill_tokens // num_prefills` ✓（实测 72/8=9 ✓、64/8=8 ✓）
+#  ② 试过挂到 *decode* 分支 ✗ —— 实测 `decodes=0 decode_tokens=0 prefills=8` ✓
+#     -> **spec-verify 在 FI 里被归为 prefill** ✓，decode 侧是死代码 ✓（已移除 ✓）
+#  ③ 元数据诊断日志（一次性 ✓）确认门控全过：
+#     enabled=True qo_indptr=True prefills=8 causal=True sw=(-1,-1) sinks=False alibi=False max_q=9 qmax=10 ✓
+#  ④ "启用日志"只加在已删除的 decode 侧 ✗ -> 用 **diag 标记环**确证钩子**确实在跑** ✓✓
+#     （标记环 92 条 hook* ✓、轨迹 attn63.* + hook7/hook5 ✓）
+#
+# **性能实测（同一 2400 字符档 ✓）**：
+#   fp8 + FI 无钩子   = **81.4 tok/s** ✓
+#   fp8 + FI + 钩子   = **47–51 tok/s** ✗  <- 慢 ~40% ✗
+#   bf16 + FA2 + 钩子 = **109.5 tok/s** ✓✓（崩溃修复后已稳定 ✓）
+# => **结论**：FI 的原生 decode（XQA / trtllm-gen）本身就优于我们的 split-KV Triton 内核 ✓
+#    -> **在 FI 路径上接钩子是负优化** ✗，**拿不回短上下文的 −26%** ✗。
+# => **正确答案**：**短上下文用 bf16+FA2+钩子（109.5 ✓✓ 现已稳定 ✓✓）**，
+#    **大容量用 fp8+FI（603K ✓）** —— 两套配置各取所长 ✓✓。
