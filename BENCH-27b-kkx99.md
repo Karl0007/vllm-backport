@@ -898,3 +898,21 @@
 #   开关默认关闭 ✓（`VLLM_SPEC_ATTN_FLASHINFER=1` 才启用 ✓），生产未设置 ✓ -> 不受影响 ✓。
 # 若将来继续 ✓：把 kv_cache 的 fp8 存储布局（每头字节数 ✗）与 split/D_KV 对齐即可 ✓，
 #   属**有界**工作 ✗（编译期就能验证 ✓）。
+
+# 【2026-09-13 崩溃根因：取证环境已到边界 ✗（配方已留 ✓）】
+# 现状 ✓：故障**影响已消除** ✓✓（fp8 路径不触发 ✓，累计 168+ 发全过 ✓）；根因未定位 ✗。
+# 已知画像 ✓（全部可复现 ✓）：图重放专属 ✗ / 稳定未映射地址（KV 基址下方 ~4.95 GB ✗）/
+#   全部索引族已排除 ✓（块表 ✓ slot_mapping ✓ 状态索引 ✓ 守卫 ✓ 采样器 ✓）/
+#   内核二分：跳过 `partial` 仍崩 ✗ -> **`combine` 锁定** ✓
+# 取证工具边界 ✗：
+#   宿主有 `cuda-gdb` ✓（/usr/local/cuda/bin/ ✓）但**镜像内没有** ✗
+#   镜像内 `apt-get install cuda-command-line-tools` **不可用** ✗（无网络 ✓，0.6 s 即失败 ✓）
+#   eager + CUDA_LAUNCH_BLOCKING **干净** ✗（48 发 ✓）-> 无法用阻塞归属图内故障 ✗
+# => 下次继续的**精确配方** ✓：
+#   ① 用宿主 CUDA toolkit 挂进容器（`-v /usr/local/cuda:/usr/local/cuda:ro` ✗）
+#      或自建带 cuda-gdb 的派生镜像 ✓（宿主有网络 ✓）
+#   ② 容器加 `--cap-add=SYS_PTRACE` ✓
+#   ③ 用 `cuda-gdb --batch -ex run --args python -m vllm.entrypoints...` 启动 ✗
+#      （即给 launcher 加一个 env 门控的 entrypoint 包装 ✗）
+#   ④ 跑复现 ✓ -> cuda-gdb 会停在故障内核并打印其名称与 PC ✓✓
+# 注：以上属**诊断**工作 ✗；对用户可见的影响已被 fp8 路径消除 ✓✓。
