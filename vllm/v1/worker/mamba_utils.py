@@ -201,6 +201,7 @@ _DIAG_SLOTS = int(_DIAG_REQS) * int(_DIAG_STATES) * int(_DIAG_FIELDS)
 _DIAG_PROD_OFF = tl.constexpr(_DIAG_SLOTS)
 _DIAG_PROD_STRIDE = tl.constexpr(64)
 _DIAG_PROG_OFF: tl.constexpr = 2 * _DIAG_SLOTS
+_DIAG_MARK_COUNT_OFF: tl.constexpr = 2 * _DIAG_SLOTS + 1
 # Scan region: 8 programs x 8 slots (8192 tokens / 1024).
 _DIAG_SCAN_OFF: tl.constexpr = 2 * _DIAG_SLOTS + 8
 _DIAG_SCAN_PROGS: tl.constexpr = 8
@@ -230,10 +231,13 @@ def get_diag_buffer():
 
 
 @triton.jit
-def _diag_mark_kernel(ptr, value, x):
+def _diag_mark_kernel(ptr, value, x, counter_ptr):
     # Also rewrites x[0] with its own value: a declared in-place write keeps the
-    # compiler from deleting the marker, and the value is unchanged.
+    # compiler from deleting the marker, and the value is unchanged. The counter
+    # counts executed markers: during a CUDA-graph replay no Python runs, so this
+    # is the only way to tell how far the replay got.
     tl.store(ptr, value)
+    tl.store(counter_ptr, tl.load(counter_ptr) + 1)
     tl.store(x, tl.load(x))
 
 
@@ -245,7 +249,7 @@ def _diag_mark_op(x: torch.Tensor, value: int) -> None:
 
     if os.environ.get("VLLM_MAMBA_DIAG", "0") == "1":
         buf, _stride, _has = get_diag_buffer()
-        _diag_mark_kernel[(1,)](buf[_DIAG_PROG_OFF:], value, x)
+        _diag_mark_kernel[(1,)](buf[_DIAG_PROG_OFF:], value, x, buf[_DIAG_MARK_COUNT_OFF:])
 
 
 @_diag_mark_op.register_fake
