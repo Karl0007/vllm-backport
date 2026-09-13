@@ -21,6 +21,8 @@ import sys
 PATCHES = {
     "mamba_hybrid.py": "v1/worker/gpu/model_states/mamba_hybrid.py",
     "fla_index.py": "third_party/flash_linear_attention/ops/index.py",
+    "ngram_embedding.py": "models/qwen4_exp/nvidia/ngram_embedding.py",
+    "kv_cache_utils.py": "v1/core/kv_cache_utils.py",
 }
 
 REQUIRED = (
@@ -33,6 +35,23 @@ REQUIRED = (
         "v1/worker/gpu/model_states/mamba_hybrid.py",
         "_pending_state_seed",
         "deferred resume seeding missing",
+    ),
+    (
+        "models/qwen4_exp/nvidia/ngram_embedding.py",
+        "weight_arg = weight_arg.view(torch.uint8)",
+        "PLE UVA lookup hands Triton an fp8e4nv pointer again (SM8x dies in profile_run)",
+    ),
+    (
+        "v1/core/kv_cache_utils.py",
+        "for layer_name, spec in group_spec.kv_cache_specs.items():\n"
+        "                if layer_name in group.layer_names:\n"
+        "                    layers_by_spec[spec].append(layer_name)",
+        "empty projected KV-cache groups emit other ranks' tensors again (PP StopIteration)",
+    ),
+    (
+        "v1/core/kv_cache_utils.py",
+        "use_trailing_layer_fallback=_uses_trailing_mtp_layers(vllm_config)",
+        "MTP draft KV groups are unannotated again (flag-all disables prefix reuse)",
     ),
 )
 
@@ -63,9 +82,8 @@ def main() -> int:
 
     patched = 0
     for root in roots:
-        mh = os.path.join(root, PATCHES["mamba_hybrid.py"])
-        idx = os.path.join(root, PATCHES["fla_index.py"])
-        if not (os.path.exists(mh) and os.path.exists(idx)):
+        targets = {name: os.path.join(root, rel) for name, rel in PATCHES.items()}
+        if not all(os.path.exists(path) for path in targets.values()):
             continue
         for name, rel in PATCHES.items():
             src = os.path.join(stage, name)
@@ -77,7 +95,7 @@ def main() -> int:
             if marker not in text:
                 print(f"{root}: {why} (missing {marker!r})", file=sys.stderr)
                 return 1
-        index_text = open(idx).read()
+        index_text = open(targets["fla_index.py"]).read()
         if "tensor_cache" in index_text:
             print(
                 f"{root}: per-step chunk metadata is cached by identity again",

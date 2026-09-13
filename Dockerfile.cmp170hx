@@ -32,6 +32,23 @@
 #     block id (Xid 13). The v0.11 line fixed this in 1cdd6bc316.
 #   - flash_linear_attention/ops/index.py: derive per-step chunk metadata on
 #     every call instead of caching it by tensor identity.
+#   - ngram_embedding.py: byte-view the FP8 PLE table for the UVA lookup
+#     kernel (upstream #56362, unmerged as of 2026-09-14). Without it the
+#     engine dies in profile_run on SM8x -- Triton refuses an fp8e4nv pointer
+#     below SM89 -- which is how Qwen3.8-Flash-Next-FP8 (e4m3 PLE table) could
+#     not start on this line at all.
+#   - v1/core/kv_cache_utils.py: skip other ranks' layers when a PP rank's KV
+#     cache group projects to empty (upstream #54793/#54711, unmerged as of
+#     2026-09-14). Without it Qwen3.8 (hybrid GDN+attention, PP 13,13,13,9)
+#     dies with a bare StopIteration in allocate_kv_cache: ranks that own only
+#     GDN layers keep the global spec dict of the empty attention group.
+#   - v1/core/kv_cache_utils.py: annotate the MTP draft KV group positionally
+#     for every MTP model, not only deepseek_v4 (upstream #55390, unmerged as
+#     of 2026-09-14). Without it Qwen3.8's groups all fall back to
+#     "draft group", and a Mamba group cannot satisfy the widened lookup
+#     window -- align-mode checkpointing never produces it -- so cross-request
+#     prefix-cache reuse is silently disabled for the GDN path (measured: an
+#     identical 294k prompt still needed a full cold prefill).
 # known gap, not carried (revisit trigger in the entry):
 #   - csrc alignment traps (v0.11 083b4aeab2): __trap() guards on the raw
 #     float4/float2 casts in csrc/libtorch_stable/{cache_kernels.cu,
@@ -64,6 +81,13 @@ sys.exit(0 if d==i else (sys.stderr.write(f'BASE DRIFT {d} != {i}\n') or 1))"
 # so `RUN python3 - <<'EOF'` silently runs nothing and reports success.
 COPY vllm/v1/worker/gpu/model_states/mamba_hybrid.py /tmp/vllm_patch/mamba_hybrid.py
 COPY vllm/third_party/flash_linear_attention/ops/index.py /tmp/vllm_patch/fla_index.py
+# Byte-views the PLE UVA lookup for FP8 tables (upstream #56362, unmerged):
+# without it the engine dies in profile_run on SM8x (Triton rejects fp8e4nv).
+COPY vllm/models/qwen4_exp/nvidia/ngram_embedding.py /tmp/vllm_patch/ngram_embedding.py
+# Skips other ranks' layers when a PP rank's KV cache group projects empty
+# (upstream #54793, unmerged): without it hybrid PP dies with a bare
+# StopIteration in allocate_kv_cache during KV init.
+COPY vllm/v1/core/kv_cache_utils.py /tmp/vllm_patch/kv_cache_utils.py
 COPY deploy/apply-vllm-patches.py /tmp/vllm_patch/apply-vllm-patches.py
 RUN python3 /tmp/vllm_patch/apply-vllm-patches.py /tmp/vllm_patch
 
