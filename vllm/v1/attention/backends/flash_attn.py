@@ -1072,6 +1072,24 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))
+        import os as _os
+
+        _sync_bisect = _os.environ.get("VLLM_FA2_SYNC_BISECT", "0") == "1"
+
+        def _sb(tag: int) -> None:
+            # Single-point sync bisect (playbook 2.4): the first sync that raises
+            # names the launch that faulted. Diagnostic only.
+            if _sync_bisect:
+                try:
+                    torch.cuda.synchronize()
+                except Exception as exc:  # noqa: BLE001
+                    import logging as _lg
+
+                    _lg.getLogger("vllm.mamba").error("SYNC_BISECT fault after tag %d: %s", tag, exc)
+                    raise
+
+        diag_mark(output, 3000 + 13)
+        _sb(13)
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         # Fix degenerate strides on size-1 dims (e.g. num_kv_heads=1 with TP).
         # FA3/4 on H100+ uses TMA, which requires ≥16-byte stride alignment.
@@ -1090,12 +1108,16 @@ class FlashAttentionImpl(AttentionImpl):
                 fixed_v.stride(),
             )
         key_cache, value_cache = fixed_k, fixed_v
+        diag_mark(output, 3000 + 15)
+        _sb(15)
 
         if is_quantized_kv_cache(self.kv_cache_dtype):
             # queries are quantized in the attention layer
             key_cache = key_cache.view(current_platform.fp8_dtype())
             value_cache = value_cache.view(current_platform.fp8_dtype())
 
+        diag_mark(output, 3000 + 16)
+        _sb(16)
         if not attn_metadata.use_cascade:
             cu_seqlens_q = attn_metadata.query_start_loc
             seqused_k = attn_metadata.seq_lens
@@ -1226,6 +1248,7 @@ class FlashAttentionImpl(AttentionImpl):
                 # sequence read by num_kv_heads thread blocks; the standalone kernel
                 # below tiles the query and the KV so the grid fills the device.
                 diag_mark(output, 3000 + 0)
+                _sb(0)
                 if (
                     _spec_attn_enabled()
                     and 1 < max_seqlen_q <= _spec_attn_qmax(self)
@@ -1257,6 +1280,7 @@ class FlashAttentionImpl(AttentionImpl):
                         return output
 
                 diag_mark(output, 3000 + 2)
+                _sb(2)
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
                     k=key_cache,

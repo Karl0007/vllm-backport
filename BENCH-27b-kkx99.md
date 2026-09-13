@@ -543,3 +543,19 @@
 #   num_accepted 快照顺序。硬结论：只在 CUDA graph 重放下（eager 48 发干净 ✓ vs 图 1-5 轮崩 ✗）。
 #   剩余嫌疑：GDN/conv 层内核、层内 mamba 状态写入（mamba_attn 侧）、reshape_and_cache、
 #   或图重放下的整体内核顺序。取证只剩两条重装备路线（cuda-gdb 附加重放 / UVA 共享内存缓冲）✗。
+
+# 【2026-09-13 诊断台已建成 + 关键结构性发现】
+# 取证台（已提交，env 门控、默认关闭）：
+#   /dev/shm 主机映射缓冲 + 零同步插桩（diag_mark 自定义算子 / diag_scan 负值扫描 /
+#   diag_py Python 直写 / diag_ring 512 条有序记录）——崩溃后外部进程仍可读。
+#   踩坑：cudaHostRegister 只对 tmpfs 有效 ✗，对绑定挂载宿主目录无效 ✗（改用宿主 /dev/shm）。
+#
+# 结构性发现（推翻此前假设）：运行在 **FULL CUDA graph** 模式（日志 "Capturing CUDA
+# graphs (FULL)"）—— 整个模型含注意力都被捕获 ✗。因此重放时**没有任何 Python 运行**：
+# 所有 gate/校验都冻结在捕获时刻 ✗。这解释了"eager 干净、图内必崩"的一整类现象，
+# 也说明此前会话里"piecewise 下注意力是 eager 执行"的注释前提在本配置下不成立 ✗。
+# 推论（待验证）：同步二分法在捕获期非法 ✗（playbook 亦然），必须在捕获期禁用。
+#
+# 已排除（本轮新增）：QMAX 尺寸（QMAX=64 仍崩 ✗）、MAX_REQS 越界（加界后仍崩 ✗）、
+# 钩子是否运行（未运行 ✗）、级联路径（未走 ✗）、slot_mapping 的 -1（内核已跳过 ✓）。
+# 仍未定位：故障内核在"后端入口之前"的窗口内 ✗（重放中无 Python，标记无法写入 ✓）。
