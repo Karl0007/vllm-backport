@@ -728,3 +728,17 @@
 #   -> 不是单一 `k * stride` ✗，更像多项和或错误基址 ✗
 # => 剩余方向：**指针/生命周期**（捕获期冻结指针 ✗）或**图/流状态交互** ✗
 #    归属手段：**cuda-gdb 附加重放** ✗（eager 干净 ✗ 无法用 CUDA_LAUNCH_BLOCKING ✓）
+
+# 【2026-09-13 ★上下文扩容第一步：fp8 KV 的真实阻断点（可修 ✗，非物理限制 ✓）】
+# KV_DTYPE=fp8 启动（其余同生产 ✓）：
+#   后端选择 -> **FlashInfer** ✓（FA2 在 sm80 不收 fp8 KV ✗，符合预期 ✓）
+#   启动即失败 ✗，报错**精确且可修**：
+#     ValueError: q.shape[0] (16) does not match qo_indptr[-1] (8).
+#     For paged prefill, q must have shape [total_tokens, num_heads, head_dim] ...
+#   16 = 2 × 8 ✗，而 8 = 1 + num_speculative_tokens(7) ✗
+#   => **投机块被重复计入** ✗（q 算了两次，qo_indptr 只算一次 ✗）
+# => 结论：FlashInfer + fp8 + 投机 在 sm80 上**不是物理限制** ✓✓（用户判断正确 ✓）
+#    而是一处**元数据构造 bug** ✗（`qo_indptr` 与 `q` 的 token 数不一致 ✗）
+#    修法方向：在 flashinfer.py 的 spec-decode 路径里让 qo_indptr 覆盖 q 的 token 数 ✗
+#    （或按 verify 语义截断 q ✗）—— 症状明确 ✓，属于可定点修复 ✓
+# 另注：fp8 KV 下钩子会被 gate 关掉 ✓（`not is_quantized_kv_cache` ✓）-> 与崩溃路径互斥 ✓
