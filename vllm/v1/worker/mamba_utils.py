@@ -423,6 +423,30 @@ def diag_dump(x: torch.Tensor | None, scratch: torch.Tensor, slot: int) -> None:
     _diag_dump_op(x, scratch, slot)
 
 
+_DIAG_CALLS_ORD = 0
+
+
+def diag_call_ordinal() -> int:
+    """Monotonic per-process hook-call ordinal (diagnostic)."""
+    global _DIAG_CALLS_ORD
+    _DIAG_CALLS_ORD += 1
+    return _DIAG_CALLS_ORD
+
+
+def diag_record_call(ordinal: int, out_ptr: int, q_ptr: int, out_numel: int) -> None:
+    """Record one hook call's buffer identities into the py region (32 calls deep)."""
+    import os
+
+    if os.environ.get("VLLM_MAMBA_DIAG", "0") != "1":
+        return
+    buf, _stride, _has = get_diag_buffer()
+    base = int(_DIAG_PY_OFF) + 16 + (ordinal % 32) * 4
+    buf[base] = ordinal
+    buf[base + 1] = out_ptr
+    buf[base + 2] = q_ptr
+    buf[base + 3] = out_numel
+
+
 def diag_layout_selftest() -> None:
     """Write a unique value at each region's start so the layout can be verified."""
     import os

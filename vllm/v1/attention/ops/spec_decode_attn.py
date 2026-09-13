@@ -305,20 +305,13 @@ class SpecDecodeAttention:
 
         import vllm.v1.worker.mamba_utils as _mu
 
-        # Record the output/query buffer identity for this call: a dangling out pointer
-        # here is the suspected root cause (Xid 31 struck in the third full-attention
-        # call of a step, and the kernel body never ran -- the launch carried a pending
-        # error, i.e. `out` was already invalid).
+        # Record this call's ordinal plus the out/query buffer identities (see the
+        # marker-ring finding: the third full-attention call of a step is where the
+        # launch already carries a pending error).
+        _ord = _mu.diag_call_ordinal()
         _op = out.data_ptr()
         _qp = q.data_ptr()
-        _mu.diag_py(
-            500,
-            _op & 0xFFFFFFFF,
-            _op >> 32,
-            int(out.numel()),
-            _qp & 0xFFFFFFFF,
-            _qp >> 32,
-        )
+        _mu.diag_record_call(_ord, _op, _qp, int(out.numel()))
         diag_mark(out, 3000 + 4)
         import logging as _lg
 
