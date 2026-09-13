@@ -185,6 +185,7 @@ def _spec_attn_combine(
     # step's token count (a stale cu_seqlens_q tail would otherwise write past them).
     if (
         i < q_len
+        and q_len <= QMAX
         and tl.load(seqused_ptr + req) > 0
         and q_start >= 0
         and q_start + q_len <= total_tokens
@@ -258,6 +259,20 @@ class SpecDecodeAttention:
         G = Hq // Hkv
         from vllm.v1.worker.mamba_utils import diag_ring
 
+        from vllm.v1.worker.mamba_utils import diag_py as _dpy
+
+        # Dedicated slot (not the ring): the ring only keeps the last 512 records and
+        # the hook's capture-time call is overwritten by later eager steps.
+        _dpy(
+            9000 + block_table.dim(),
+            9000 + block_table.stride(0) % 1000,
+            9000 + block_table.shape[0] % 1000,
+            9000 + block_table.shape[-1] % 1000,
+            9000 + key_cache.shape[0] % 1000,
+            9000 + key_cache.shape[1] % 1000,
+            9000 + self.qmax,
+            9000 + int(block_table.element_size()),
+        )
         diag_ring(
             2,
             num_reqs,
@@ -280,6 +295,15 @@ class SpecDecodeAttention:
         assert num_reqs <= self.max_num_reqs
         # shared memory on sm86 is 99 KB: q tile + one K and one V tile + scores must fit
         block_m, qt, ntile, warps = self._plan(max_query_len, G, D)
+        # Live arguments at (possibly) replay time: scalars here are frozen at capture,
+        # tensors are not. Dump both so a post-mortem can spot the mismatch.
+        from vllm.v1.worker.mamba_utils import diag_dump as _dd
+
+        _dd(seqused_k, out, 0)
+        _dd(cu_seqlens_q, out, 1)
+        _dd(block_table, out, 2)
+        diag_ring(9, num_reqs, max_query_len, q.shape[0], key_cache.shape[0],
+                  key_cache.shape[1], self.qmax, block_m, qt, ntile, warps)
         # TILE=64 up to D=256 (measured on the 170HX at the production shape
         # Hq=24/Hkv=4/D=256/q=8, kv=117,535, block_size=832: 0.876 ms/layer against
         # 1.450 at TILE=32, 1.66x; tied at batch 8; 0.076 vs 0.086 ms at kv=2.3k, i.e.

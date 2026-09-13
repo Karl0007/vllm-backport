@@ -19,6 +19,7 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.v1.worker.mamba_utils import diag_mark
 from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
@@ -358,19 +359,23 @@ class DFlashQwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        diag_mark(hidden_states, 4000)
         if residual is not None:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         else:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
+        diag_mark(hidden_states, 4001)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
 
+        diag_mark(hidden_states, 4002)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+        diag_mark(hidden_states, 4003)
         return hidden_states, residual
 
 
@@ -774,7 +779,10 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.model(input_ids, positions, inputs_embeds)
+        diag_mark(inputs_embeds if inputs_embeds is not None else input_ids, 5000)
+        _out = self.model(input_ids, positions, inputs_embeds)
+        diag_mark(_out[0] if isinstance(_out, tuple) else _out, 5001)
+        return _out
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         return [layer.self_attn.attn.layer_name for layer in self.model.layers]

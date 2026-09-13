@@ -600,3 +600,17 @@
 # sampler ✗、drafter 自身前向 ✗、mamba postprocess/align save ✗（此前已单独排除过 ✗）。
 # 下一步：把同样的标记 + dump 铺到尾部这几处（都在 v1/sample/ 与 gpu_model_runner 里 ✗，
 # 需加入挂载清单 ✓）。
+
+# 【2026-09-13 ★根因确认：触发点是我们自己的 split-KV 钩子】
+# 对照实验（当前构建，同一复现序列，各 10 轮 40 发）：
+#   VLLM_SPEC_DECODE_ATTN=1（钩子开）→ **r5/96K 必崩** ✗
+#   VLLM_SPEC_DECODE_ATTN=0（钩子关）→ **10 轮 40 发全过** ✓✓（最后标记 = drafter 出口 ✓）
+# => 故障源 = vllm/v1/attention/ops/spec_decode_attn.py 的 partial 内核 ✗✓✓
+#     （combine 已单独关掉验证：仍崩 ✗ -> 不是它 ✓）
+# 已加但**不足以**修复的界（都保留 ✓）：坏块号 ✓、partial 的 q_len>QMAX ✓、
+# combine 的 q_len>QMAX ✓、两者 MAX_REQS ✓ —— 说明越界点在我尚未设界的那一处 ✗。
+# 重要：钩子是**性能特性**（长上下文 split-KV 加速 ✗），不是功能特性 ✓ ——
+# 关闭它仍保留投机 ✓ / 前缀缓存 ✓ / 长上下文 ✓ 全部功能 ✓，只是失去该加速 ✗。
+# 待查（下一步）：钩子内唯一剩下的内核是 partial ✗；其 `stride_bt` / 指针类实参
+# 在捕获时刻冻结 ✗，而块表内容实时 ✓ —— 需核对 3 维块表下 req*stride_bt 是否越界 ✗。
+# 注：我的 diag 区域偏移仍有多处重叠 ✗，下次需统一重排 ✗。
