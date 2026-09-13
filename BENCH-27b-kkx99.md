@@ -805,3 +805,23 @@
 #    （即 forward 复用 metadata 里的切分结果 ✓），或让 builder 采用 forward 的切分 ✗
 # 注：这是**软件一致性 bug** ✓，与 sm80 / fp8 硬件无关 ✓；fp8+投机 一旦修好，
 #    速度可拿回 15~25% ✓（容量仍为 603K ✗ —— 投机预留 speculative blocks 是设计使然 ✓）
+
+# 【2026-09-13 ★修正 + fp8+投机 报错的真正根因（到行 ✓）】
+# **修正上一轮** ✗：所谓"两处切分不一致"是误读 ✓ —— `split_decodes_and_prefills` 全文件
+#   只有一处调用（在 `FlashInferMetadataBuilder.build` 里 ✓），**不存在两套切分** ✗。
+#
+# 真正的矛盾在 **metadata 内部** ✗✓：
+#   forward 侧（flashinfer.py:2146-2147 ✓）：
+#       prefill_query = query[num_decode_tokens:]
+#       assert prefill_query.shape[0] == num_prefill_tokens     # 该断言**通过了** ✓
+#   -> 说明 metadata 里 `num_prefill_tokens = 16` ✗
+#   而同一 metadata 的 builder（:1534-1537 ✓）用 `num_prefills = 1` 推出
+#       qo_indptr_prefill = [0, 8] ✗（只覆盖 8 ✓）
+#   => **同一请求被记为"prefill、16 token"，其 indptr 却只覆盖 8** ✗✓
+#
+# 根因 ✓：**投机下 `num_actual_tokens`（16 = 8 verify + 8 draft ✗）与
+#   `query_start_loc`（8 ✗）口径不一致** ✗ —— 即 runner 交给后端的 "query 张量" 与
+#   "query_start_loc" 描述的 token 数不同 ✓✓。**与 sm80 / fp8 硬件无关** ✓。
+# 修法方向 ✓：让二者口径一致（把 draft token 计入 query_start_loc ✗，或让 FlashInfer
+#   只消费 verify 段 ✗）—— 修好后 `fp8 + 投机` 可跑 ✓，速度拿回 15~25% ✓
+#   （容量仍 603K ✗ —— 投机预留 speculative blocks 属设计 ✓）。
