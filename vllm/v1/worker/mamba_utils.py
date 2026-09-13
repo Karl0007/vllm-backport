@@ -1924,7 +1924,12 @@ def preprocess_mamba(
         # Block 2: speculative block
         # Block 3: speculative block
         # And use block 1 to save the running state.
-        curr_state_idx = num_blocks - 1 - num_speculative_blocks
+        # The speculative blocks cancel: this is cdiv(computed + scheduled, block_size) - 1,
+        # which is -1 when a request has nothing computed and nothing scheduled (a padded
+        # row). The consumers only exclude the null block id (0), so a -1 here indexes the
+        # state cache far below its base and faults the GPU (Xid 31 at a stable address
+        # ~4-5 GB under the KV cache). Land such rows on the null block instead.
+        curr_state_idx = max(num_blocks - 1 - num_speculative_blocks, 0)
         mamba_state_idx[req_id] = curr_state_idx
         if fused is not None:
             fused.state_idx.np[i] = curr_state_idx

@@ -1319,8 +1319,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # deliberately loose upper bound (the pool is ~188 blocks).
         from vllm.v1.worker.mamba_utils import diag_scan as _ds
 
-        _ds(spec_state_indices_tensor, spec_state_indices_tensor, 6, -1, 4096)
-        _ds(non_spec_state_indices_tensor, non_spec_state_indices_tensor, 7, -1, 4096)
+        _ds(spec_state_indices_tensor, spec_state_indices_tensor, 6, -1, 256)
+        _ds(non_spec_state_indices_tensor, non_spec_state_indices_tensor, 7, -1, 256)
         self_kv_cache = self.kv_cache
         # conv_state must be (..., dim, width-1) for the conv kernels.
         # DS layout stores it that way directly; SD layout needs a transpose.
