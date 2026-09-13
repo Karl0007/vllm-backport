@@ -189,39 +189,43 @@ def _spec_attn_partial(
             tl.store(diag_ptr + 5, first)
             tl.store(diag_ptr + 6, tl.min(tl.where(bad, blk, 1 << 30)))
             tl.store(diag_ptr + 7, nblocks)
-        k_ok = k_ok & ~bad
+        k_pos = k_ok & ~bad   # 1-D position validity (drives the score mask too)
         slot = pos % BLOCK_SIZE
         # Every address component of the gather, written unconditionally: the fault is
         # inside this gather (skipping it is stable, running it crashes) and the block-id
         # guard never fires, so one of the strides or extents must be the wild one.
-        tl.store(diag_ptr + 50, tl.max(blk))
-        tl.store(diag_ptr + 51, tl.max(slot))
-        tl.store(diag_ptr + 52, stride_kb)
-        tl.store(diag_ptr + 53, stride_ks)
-        tl.store(diag_ptr + 54, BLOCK_SIZE)
-        tl.store(diag_ptr + 55, nblocks)
-        tl.store(diag_ptr + 56, kv_len)
-        tl.store(diag_ptr + 57, tl.max(k_ptrs.to(tl.int64, bitcast=False) - k_ptr) if False else D_KV)
-        tl.store(diag_ptr + 58, stride_kh)
-        tl.store(diag_ptr + 59, kvh)
-        k_ptrs = k_ptr + blk[:, None] * stride_kb + slot[:, None] * stride_ks + kvh * stride_kh + dkv[None, :]
+        # Bound the gather offset explicitly, against the cache extent derived from the
+        # same parameters the strides came from. Every earlier guard constrains an index
+        # (block id, slot, kv length) but not the composed address, so a parameter set
+        # that is internally consistent yet stale relative to the live tensors still walks
+        # out of the cache; masking on the composed offset closes that hole.
+        k_off = (blk[:, None] * stride_kb + slot[:, None] * stride_ks
+                 + kvh * stride_kh + dkv[None, :])
+        v_off = (blk[:, None] * stride_vb + slot[:, None] * stride_vs
+                 + kvh * stride_vh + dkv[None, :])
+        k_lim = nblocks * stride_kb
+        v_lim = nblocks * stride_vb
+        g_ok = k_pos[:, None] & (k_off >= 0) & (k_off < k_lim)
+        gv_ok = k_pos[:, None] & (v_off >= 0) & (v_off < v_lim)
+        k_ptrs = k_ptr + k_off
+        v_ptrs = v_ptr + v_off
         v_ptrs = v_ptr + blk[:, None] * stride_vb + slot[:, None] * stride_vs + kvh * stride_vh + dkv[None, :]
         if KV_FP8:
             # sm80's Triton cannot load float8e4nv, so read the raw bytes and decode
             # e4m3 in software: sign(1) | exp(4) | mantissa(3), bias 7.
-            kb = tl.load(k_ptrs, mask=k_ok[:, None], other=0).to(tl.uint8)
-            vb = tl.load(v_ptrs, mask=k_ok[:, None], other=0).to(tl.uint8)
+            kb = tl.load(k_ptrs, mask=g_ok, other=0).to(tl.uint8)
+            vb = tl.load(v_ptrs, mask=gv_ok, other=0).to(tl.uint8)
             k = (_e4m3_to_fp32(kb) * k_scale).to(tl.bfloat16)
             v = (_e4m3_to_fp32(vb) * v_scale).to(tl.bfloat16)
         else:
             # Unquantized cache: load verbatim (no conversion) so the bf16 fast path is
             # byte-for-byte what it was before the fp8 support was added.
             tl.store(diag_ptr + 18, 18)   # 步进：已进入 KV 循环
-            k = tl.load(k_ptrs, mask=k_ok[:, None], other=0.0)
-            v = tl.load(v_ptrs, mask=k_ok[:, None], other=0.0)
+            k = tl.load(k_ptrs, mask=g_ok, other=0.0)
+            v = tl.load(v_ptrs, mask=gv_ok, other=0.0)
         tl.store(diag_ptr + 19, 19)   # 步进：k/v 已加载
         s = tl.dot(qs, tl.trans(k)).to(tl.float32)            # [BLOCK_M, TILE]
-        allowed = k_ok[None, :] & (pos[None, :] <= q_pos[:, None]) & row_ok[:, None]
+        allowed = k_pos[None, :] & (pos[None, :] <= q_pos[:, None]) & row_ok[:, None]
         s = tl.where(allowed, s, float("-inf"))
         m_new = tl.maximum(m_i, tl.max(s, 1))
         m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
@@ -363,7 +367,7 @@ class SpecDecodeAttention:
         _buf, _stride, _has = get_diag_buffer()
         # Record the kernel's own guard hits in host-mapped memory: a device-side
         # diag dies with the CUDA context, which is exactly when it is needed.
-        diag_ptr = _buf[ATTN_DIAG_OFF : ATTN_DIAG_OFF + 48] if _has else self.diag
+        diag_ptr = _buf[ATTN_DIAG_OFF : ATTN_DIAG_OFF + 128] if _has else self.diag
         Hq, D = q.shape[1], q.shape[2]
         Hkv = key_cache.shape[2]
         G = Hq // Hkv
