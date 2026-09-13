@@ -350,6 +350,47 @@ def diag_ring(*values: int) -> int:
     return _DIAG_RING_COUNTER - 1
 
 
+_DIAG_DUMP_OFF: tl.constexpr = 2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16 + _DIAG_PY_SLOTS + 512 * 16 + 1
+_DIAG_DUMP_SLOTS: tl.constexpr = 4
+_DIAG_DUMP_LEN: tl.constexpr = 512
+
+
+@triton.jit
+def _diag_dump_kernel(x_ptr, n, out_ptr, scratch):
+    pid = tl.program_id(0)
+    offs = pid * 256 + tl.arange(0, 256)
+    m = offs < n
+    v = tl.load(x_ptr + offs, mask=m, other=0).to(tl.int64)
+    tl.store(out_ptr + offs, v, mask=m)
+    tl.store(scratch, tl.load(scratch))
+
+
+@torch.library.custom_op("vllm::diag_dump", mutates_args={"scratch"})
+def _diag_dump_op(x: torch.Tensor, scratch: torch.Tensor, slot: int) -> None:
+    # Runs inside the CUDA graph, so it records the LIVE tensor contents at replay
+    # time (scalar arguments are frozen at capture, tensors are not).
+    import os
+
+    if os.environ.get("VLLM_MAMBA_DIAG", "0") != "1":
+        return
+    buf, _stride, _has = get_diag_buffer()
+    n = min(x.numel(), _DIAG_DUMP_LEN)
+    base = _DIAG_DUMP_OFF + slot * _DIAG_DUMP_LEN
+    _diag_dump_kernel[(triton.cdiv(n, 256),)](x, n, buf[base:], scratch)
+
+
+@_diag_dump_op.register_fake
+def _diag_dump_fake(x: torch.Tensor, scratch: torch.Tensor, slot: int) -> None:
+    return None
+
+
+def diag_dump(x: torch.Tensor | None, scratch: torch.Tensor, slot: int) -> None:
+    """Copy a small tensor's live contents into the capture buffer (no-op unless on)."""
+    if x is None:
+        return
+    _diag_dump_op(x, scratch, slot)
+
+
 def diag_mark(x: torch.Tensor, value: int) -> None:
     """Per-layer progress marker (diagnostic only; identity unless VLLM_MAMBA_DIAG=1).
 
@@ -376,7 +417,7 @@ def open_diag_buffer():
 
     import torch
 
-    size = (2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16 + _DIAG_PY_SLOTS + 512 * 16 + 1) * 8
+    size = (2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16 + _DIAG_PY_SLOTS + 512 * 16 + 1 + 4 * 512) * 8
     if not os.path.exists(_DIAG_PATH):
         with open(_DIAG_PATH, "wb") as f:
             f.write(b"\0" * size)
@@ -386,7 +427,7 @@ def open_diag_buffer():
     err = torch.cuda.cudart().cudaHostRegister(int(addr), size, 2)  # Mapped
     if int(err) != 0:
         raise RuntimeError(f"cudaHostRegister failed: {err}")
-    out = torch.frombuffer(buf, dtype=torch.int64, count=2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16 + _DIAG_PY_SLOTS + 512 * 16 + 1)
+    out = torch.frombuffer(buf, dtype=torch.int64, count=2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16 + _DIAG_PY_SLOTS + 512 * 16 + 1 + 4 * 512)
     out.fill_(-1)
     return out
 

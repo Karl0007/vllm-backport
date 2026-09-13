@@ -10,7 +10,7 @@ from typing import ClassVar
 import numpy as np
 import torch
 
-from vllm.v1.worker.mamba_utils import diag_mark, diag_py, diag_ring, diag_scan
+from vllm.v1.worker.mamba_utils import diag_dump, diag_mark, diag_py, diag_ring, diag_scan
 
 from vllm.model_executor.layers.attention import Attention
 from vllm.platforms import current_platform
@@ -1118,6 +1118,11 @@ class FlashAttentionImpl(AttentionImpl):
 
         diag_mark(output, 3000 + 16)
         _sb(16)
+        # Live (replay-time) metadata: scalar args are frozen at capture, tensors are not.
+        diag_dump(attn_metadata.seq_lens, output, 0)
+        diag_dump(attn_metadata.query_start_loc, output, 1)
+        diag_dump(attn_metadata.block_table, output, 2)
+        diag_dump(attn_metadata.slot_mapping, output, 3)
         if not attn_metadata.use_cascade:
             cu_seqlens_q = attn_metadata.query_start_loc
             seqused_k = attn_metadata.seq_lens
