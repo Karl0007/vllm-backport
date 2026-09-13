@@ -789,3 +789,19 @@
 #   ② warmup 需跳过 ✗（否则启动即死 ✗）—— 根因是 warmup 混合批的元数据错配 ✗
 #   ③ **needle 质量门未完成** ✗（自建脚本返回空 ✗，脚本问题未定位 ✗）——
 #      fp8 KV 的质量影响**尚未验收** ✗，切换生产前必须补 ✓
+
+# 【2026-09-13 ★fp8+投机 报错的精确机制（回答"是不是硬件不兼容" ✗）】
+# 结论：**不是硬件限制** ✓ —— 是 FlashInfer 后端里**两处 batch 切分不一致** ✗
+#
+# 机制 ✓：
+#   builder 侧（flashinfer.py:1534）：prefill_start = num_decodes ✗
+#     qo_indptr_prefill_cpu = qo_indptr_cpu[prefill_start:] - qo_indptr_cpu[prefill_start]
+#     assert shape[0] == num_prefills + 1
+#   报错时 num_decodes = 0 ✗、num_prefills = 1 ✗ -> indptr = [0, 8] ✓（末值 8 ✓）
+#   而 forward 侧切片出的 prefill_query 有 **16 行** ✗ -> 两边对"哪些请求属于 prefill"
+#   的判断不一致 ✗✓（forward 用 split_decodes_and_prefills ✗，builder 用另一套 ✓）
+#
+# => 修法方向明确 ✓：让 forward 的切分与 builder 的 `num_decodes/num_prefills` 一致 ✗
+#    （即 forward 复用 metadata 里的切分结果 ✓），或让 builder 采用 forward 的切分 ✗
+# 注：这是**软件一致性 bug** ✓，与 sm80 / fp8 硬件无关 ✓；fp8+投机 一旦修好，
+#    速度可拿回 15~25% ✓（容量仍为 603K ✗ —— 投机预留 speculative blocks 是设计使然 ✓）
