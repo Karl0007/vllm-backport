@@ -201,7 +201,13 @@ def run_mixed_prefill_decode_warmup(
         worker_execute_model(decode_prefill_output)
         worker_sample_tokens(None)
         with context:
-            worker_execute_model(mixed_output)
+            import os as _o
+
+            if _o.environ.get("VLLM_SKIP_MIXED_WARMUP", "0") != "1":
+                # Diagnostic/workaround: with a quantized KV cache plus speculative
+                # decoding the mixed batch trips FlashInfer's q vs qo_indptr check
+                # (q=16 rows, qo_indptr[-1]=8). Skipping it costs one JIT compile later.
+                worker_execute_model(mixed_output)
             worker_sample_tokens(None)
         worker_execute_model(cleanup_output)
     finally:

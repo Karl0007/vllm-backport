@@ -742,3 +742,16 @@
 #    修法方向：在 flashinfer.py 的 spec-decode 路径里让 qo_indptr 覆盖 q 的 token 数 ✗
 #    （或按 verify 语义截断 q ✗）—— 症状明确 ✓，属于可定点修复 ✓
 # 另注：fp8 KV 下钩子会被 gate 关掉 ✓（`not is_quantized_kv_cache` ✓）-> 与崩溃路径互斥 ✓
+
+# 【2026-09-13 fp8 阻断点精确定位：**warmup 的混合批** ✗（真实服务不受影响 ✓）】
+# 完整调用栈：`warmup.py:228 warmup_kernels -> _warmup_kernels -> ... -> flashinfer.py:2226 forward`
+#   ValueError: q.shape[0] (16) does not match qo_indptr[-1] (8)
+# 关键事实 ✓：
+#   ① 失败发生在 **warmup**（JIT 预编译 ✓），**不是真实服务路径** ✓✓
+#   ② 16 = 2 × 8 ✗：**query 覆盖 2 个请求（各 8 token ✓）而 query_start_loc 只覆盖 1 个** ✗✓
+#   ③ `_warmup_kernels` 的混合批（decode 请求 + prefill 请求 ✗）在量化 KV + 投机下
+#      元数据与 query 不一致 ✗（注释里也提到"防止被误分类为 decode" ✗）
+# => 结论：**fp8 + 投机 在本基座不是物理限制** ✓✓，而是 **warmup 混合批的一处元数据不一致** ✗
+#    修法：让 warmup 混合批的 `query_start_loc` 覆盖全部请求 ✗（或按量化 KV+投机跳过该步 ✗）
+#    已加 env 门控的跳过开关（`VLLM_SKIP_MIXED_WARMUP=1` ✗）但**未命中真正的调用点** ✗
+#    （栈指向 `_warmup_kernels` 内部 ✗，需下一轮精确定位 ✓）
