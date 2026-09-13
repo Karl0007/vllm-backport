@@ -198,14 +198,9 @@ _DIAG_FIELDS = tl.constexpr(16)
 _DIAG_SLOTS = int(_DIAG_REQS) * int(_DIAG_STATES) * int(_DIAG_FIELDS)
 # Producer records (preprocess advance / postprocess decision) live in a second
 # region of the same buffer, so the two kernel families never share a slot.
-_DIAG_PROD_OFF = tl.constexpr(_DIAG_SLOTS)
 _DIAG_PROD_STRIDE = tl.constexpr(64)
-_DIAG_PROG_OFF: tl.constexpr = 2 * _DIAG_SLOTS
-_DIAG_MARK_COUNT_OFF: tl.constexpr = 2 * _DIAG_SLOTS + 1
-_DIAG_LAYER_OFF: tl.constexpr = 2 * _DIAG_SLOTS + 2
 _DIAG_LAYER_N: tl.constexpr = 128
 # Scan region: 8 programs x 8 slots (8192 tokens / 1024).
-_DIAG_SCAN_OFF: tl.constexpr = 2 * _DIAG_SLOTS + 8
 _DIAG_SCAN_PROGS: tl.constexpr = 8
 _DIAG_BUF = None
 _DIAG_DUMMY = None
@@ -315,7 +310,6 @@ def diag_scan(x: torch.Tensor | None, scratch: torch.Tensor, tag: int, layer: in
     _diag_scan_op(x, scratch, tag, layer, upper)
 
 
-_DIAG_PY_OFF = 2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16 + 512 * 16 + 1 + 4 * 512
 _DIAG_PY_SLOTS = 64
 
 
@@ -332,10 +326,9 @@ def diag_py(*values: int) -> None:
         return
     buf, _stride, _has = get_diag_buffer()
     for i, v in enumerate(values[: _DIAG_PY_SLOTS]):
-        buf[_DIAG_PY_OFF + i] = int(v)
+        buf[int(_DIAG_PY_OFF) + i] = int(v)
 
 
-_DIAG_RING_OFF = 2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16 + _DIAG_PY_SLOTS
 _DIAG_RING_N = 512
 _DIAG_RING_FIELDS = 16
 _DIAG_RING_COUNTER = 0
@@ -354,18 +347,34 @@ def diag_ring(*values: int) -> int:
         return -1
     buf, _stride, _has = get_diag_buffer()
     idx = _DIAG_RING_COUNTER % _DIAG_RING_N
-    base = _DIAG_RING_OFF + idx * _DIAG_RING_FIELDS
-    buf[base] = _DIAG_RING_COUNTER
+    base = int(_DIAG_RING_OFF) + idx * _DIAG_RING_FIELDS
+    buf[int(base)] = _DIAG_RING_COUNTER
     for i, v in enumerate(values[: _DIAG_RING_FIELDS - 1]):
         buf[base + 1 + i] = int(v)
-    buf[_DIAG_RING_OFF + _DIAG_RING_N * _DIAG_RING_FIELDS] = _DIAG_RING_COUNTER + 1
+    buf[int(_DIAG_RING_OFF) + _DIAG_RING_N * _DIAG_RING_FIELDS] = _DIAG_RING_COUNTER + 1
     _DIAG_RING_COUNTER += 1
     return _DIAG_RING_COUNTER - 1
 
 
-_DIAG_DUMP_OFF: tl.constexpr = 2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16 + _DIAG_PY_SLOTS + 512 * 16 + 1
 _DIAG_DUMP_SLOTS: tl.constexpr = 4
 _DIAG_DUMP_LEN: tl.constexpr = 512
+
+# ---------------------------------------------------------------------------
+# One-shot capture-buffer layout: every region starts where the previous ends.
+# This is the single source of truth -- earlier ad-hoc offsets overlapped, which
+# made the buffer unreadable (a Python-written sentinel was silently overwritten
+# by a kernel dump region, and several scans landed on each other).
+# ---------------------------------------------------------------------------
+_DIAG_PROD_OFF = tl.constexpr(_DIAG_SLOTS)
+_DIAG_PROD_STRIDE = tl.constexpr(64)
+_DIAG_PROG_OFF: tl.constexpr = _DIAG_PROD_OFF + _DIAG_REQS * _DIAG_PROD_STRIDE
+_DIAG_MARK_COUNT_OFF: tl.constexpr = _DIAG_PROG_OFF + 1
+_DIAG_LAYER_OFF: tl.constexpr = _DIAG_PROG_OFF + 2
+_DIAG_SCAN_OFF: tl.constexpr = _DIAG_LAYER_OFF + _DIAG_LAYER_N
+_DIAG_PY_OFF = _DIAG_SCAN_OFF + _DIAG_SCAN_PROGS * 8 + 16
+_DIAG_RING_OFF = _DIAG_PY_OFF + _DIAG_PY_SLOTS
+_DIAG_DUMP_OFF: tl.constexpr = _DIAG_RING_OFF + _DIAG_RING_N * _DIAG_RING_FIELDS + 1
+_DIAG_TOTAL = _DIAG_DUMP_OFF + _DIAG_DUMP_SLOTS * _DIAG_DUMP_LEN
 
 
 @triton.jit
@@ -404,6 +413,33 @@ def diag_dump(x: torch.Tensor | None, scratch: torch.Tensor, slot: int) -> None:
     _diag_dump_op(x, scratch, slot)
 
 
+def diag_layout_selftest() -> None:
+    """Write a unique value at each region's start so the layout can be verified."""
+    import os
+
+    if os.environ.get("VLLM_MAMBA_DIAG", "0") != "1":
+        return
+    import logging
+
+    buf, _stride, _has = get_diag_buffer()
+    marks = {
+        "copy": 0,
+        "prod": int(_DIAG_PROD_OFF),
+        "progress": int(_DIAG_PROG_OFF),
+        "scan": int(_DIAG_SCAN_OFF),
+        "hook_guard": int(_DIAG_SCAN_OFF) + int(_DIAG_SCAN_PROGS) * 8,
+        "py": int(_DIAG_PY_OFF),
+        "ring": int(_DIAG_RING_OFF),
+        "dump": int(_DIAG_DUMP_OFF),
+        "layer": int(_DIAG_LAYER_OFF),
+    }
+    for name, off in marks.items():
+        buf[int(off)] = 42000 + list(marks).index(name)
+    logging.getLogger("vllm.mamba").warning(
+        "DIAG_LAYOUT total=%d %s", int(buf.numel()), {k: int(v) for k, v in marks.items()}
+    )
+
+
 def diag_mark(x: torch.Tensor, value: int, layer: int = -1) -> None:
     """Per-layer progress marker (diagnostic only; identity unless VLLM_MAMBA_DIAG=1).
 
@@ -430,7 +466,7 @@ def open_diag_buffer():
 
     import torch
 
-    size = (2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16 + _DIAG_PY_SLOTS + 512 * 16 + 1 + 4 * 512 + 128 + _DIAG_PY_SLOTS) * 8
+    size = int(_DIAG_TOTAL) * 8
     if not os.path.exists(_DIAG_PATH):
         with open(_DIAG_PATH, "wb") as f:
             f.write(b"\0" * size)
@@ -440,7 +476,7 @@ def open_diag_buffer():
     err = torch.cuda.cudart().cudaHostRegister(int(addr), size, 2)  # Mapped
     if int(err) != 0:
         raise RuntimeError(f"cudaHostRegister failed: {err}")
-    out = torch.frombuffer(buf, dtype=torch.int64, count=2 * _DIAG_SLOTS + 8 + _DIAG_SCAN_PROGS * 8 + 16 + _DIAG_PY_SLOTS + 512 * 16 + 1 + 4 * 512 + 128 + _DIAG_PY_SLOTS)
+    out = torch.frombuffer(buf, dtype=torch.int64, count=int(_DIAG_TOTAL))
     out.fill_(-1)
     return out
 

@@ -216,7 +216,10 @@ def _spec_attn_combine(
         tl.store(out_ptr + row * stride_ot + h * stride_oh + d, o.to(out_ptr.dtype.element_ty))
 
 
-ATTN_DIAG_OFF = 2 * 16384 + 8 + 64  # after copy/prod/progress/scan regions
+# Must match mamba_utils' one-shot layout (hook_guard region).
+from vllm.v1.worker.mamba_utils import _DIAG_SCAN_OFF, _DIAG_SCAN_PROGS
+
+ATTN_DIAG_OFF = int(_DIAG_SCAN_OFF) + int(_DIAG_SCAN_PROGS) * 8
 
 
 class SpecDecodeAttention:

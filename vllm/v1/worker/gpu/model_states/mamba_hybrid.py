@@ -266,6 +266,9 @@ class MambaHybridModelState(DefaultModelState):
                             "  SEG_BLK addr=%#x end=%#x size=%.1f MiB state=%s",
                             _ba, _ba + int(b["size"]), int(b["size"]) / 2**20, b.get("state", ""),
                         )
+        import vllm.v1.worker.mamba_utils as _mu
+
+        _mu.diag_layout_selftest()
         if self._pending_state_seed:
             # Seed from the resumed position with the mamba block size, before any
             # kernel reads state_idx.
