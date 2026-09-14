@@ -1268,3 +1268,60 @@ from `available KV / tokens`:
 
 At 640K tokens the draft-state term is ~10 GiB of pool, several times the 1.19-3.58
 GiB the checkpoint occupies on disk. Dropping k from 7 to 4 is the cheaper lever.
+
+## 2026-09-14 (late): the six-arm sweep, all numbers re-taken on one protocol
+
+Protocol, for every arm and every number below: the repo's own harnesses through
+`bench/allover326/run.py` (which injects BENCH_KEY/BENCH_PORT/BENCH_MODEL), strictly
+serial -- one arm at a time on one GPU -- with one discarded warmup pass of decode3
+before any measurement, so Triton JIT and CUDA-graph cold start are out of the read.
+GMU 0.96, ASYNC_SCHED=1, SPEC_ATTN=1, fp8 KV unless the column says otherwise,
+max-model-len 262144, all on one CMP 170HX.
+
+- `bench_decode3.py` -- three content types x 400 tokens, AGGREGATE column
+- `bench_decode_stream.py` -- 2K/8K/32K/65K/100K, streaming, single sample per point
+- `bench_prefill.py` -- reported at the ~4K point (~5400 real tokens)
+
+| arm | target + draft | KV dtype | KV pool | decode3 | 2K | 8K | 32K | 65K | 100K | prefill@4K |
+|---|---|---|---|---|---|---|---|---|---|---|
+| A | awq-int4-eq8emb + DFlash2 W4A16 k7 | fp8 | 645,198 | 99.3 | 205.1 | 199.9 | 184.6 | 178.6 | 156.6 | 1749 |
+| B | awq-int4-eq8emb + DFlash2 W4A16 k7 | bf16 | 472,353 | 118.0 | 147.6 | 110.4 | 139.6 | 138.3 | 146.8 | 1696 |
+| C | awq-int4-eq8emb + DFlash2 k7 (original) | fp8 | 606,095 | 97.5 | 204.0 | 212.3 | 168.8 | 184.8 | 154.7 | 1753 |
+| D | awq-int4-eq8emb + DSpark k4 | fp8 | 721,719 | 81.1 | 111.0 | 73.9 | 115.1 | 97.8 | 90.3 | 1699 |
+| E | awq-int4-eq8emb + MTP k4 (own head) | fp8 | 1,102,163 | 74.4 | 76.1 | 84.9 | 103.2 | 99.8 | 61.9 | 1685 |
+| F | efficientthink-fp8 + ET-DFlash2-fp8 k7 | fp8 | 467,434 | 80.0 | 166.7 | 167.2 | 143.4 | 135.9 | 148.1 | 1618 |
+
+TTFT (s), same runs:
+
+| arm | 2K | 8K | 32K | 65K | 100K |
+|---|---|---|---|---|---|
+| A | 0.94 | 3.46 | 14.97 | 34.26 | 58.90 |
+| B | 0.96 | 3.45 | 14.88 | 33.22 | 56.66 |
+| C | 0.94 | 3.45 | 14.91 | 34.12 | 58.74 |
+| D | 0.99 | 3.52 | 15.07 | 34.37 | 59.22 |
+| E | 1.01 | 3.56 | 15.27 | 34.98 | 60.56 |
+| F | 1.03 | 3.76 | 16.16 | 36.62 | 62.50 |
+
+Readings:
+
+- The protocol reproduces the earlier formal sweep within 1%: that sweep had bf16
+  117.5 and fp8 97.6, this one 118.0 and 99.3. Same scripts, same content, and now
+  at GMU 0.96 with async scheduling on.
+- B's curve is non-monotonic (147 -> 110 -> 140 -> 138 -> 147). That is the known
+  65K dip of the FA2 + split-KV hook path, recorded in the earlier sweep too, not
+  sampling noise: A/C/D/E/F are all monotonic.
+- C (original draft, 3.58 GiB) and A (W4A16 draft, 1.19 GiB) are equal on speed
+  (97.5 vs 99.3, inside noise). Quantizing the draft costs 39K tokens of pool and
+  buys nothing on speed -- so it is free capacity, not a speed trade.
+- D, E and F land 19-25% below A, matching the earlier -20%/-37%/-20%. mtp keeps the
+  largest pool (1.10M tokens, ~1.7x A) because it drafts from the target's own head
+  and loads no second model at all.
+
+GMU 0.975 was tried first and is not usable: decode3 and the 2K/8K points run
+(98.2 tok/s), then a 32K request dies with CUDA OutOfMemoryError and the engine core
+exits. 0.975 x 64 GiB leaves 1.6 GiB of slack, and the prefill activation peak is an
+absolute size that does not shrink with the percentage -- which is the answer to
+"does the headroom scale with the fraction or the absolute size": the allowance is
+fractional, every consumer is absolute. At 0.975 the pool numbers are reachable
+(A 660,376 / B 483,577 / C 621,273 / D 739,995 / E 1,128,233 / F 460,488) but
+long-context requests cannot use them.
