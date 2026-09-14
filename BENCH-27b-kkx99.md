@@ -1133,3 +1133,138 @@
 #   要容量 -> fp8+FlInfer+dflash   = 603K / 97.6 ✓✓
 #   不用   -> dspark ✗ / mtp ✗（均慢于 dflash ✓）
 #   微调 FP8 仅在需要其模型质量时考虑 ✓（速度 −20% ✗）
+
+## 2026-09-14 (evening): gpu-memory-utilization 0.92 -> 0.96, and MTP/DSpark at k=4
+
+Same box, same model (`qwen3.8-27b-awq-int4-eq8emb`), same KV dtype (fp8), spec-KV
+split kernel ON, one arm per GPU, both launched through `launch-27b-kkx99.sh` with
+`GMU=0.96`. Harness: `model-runtime/tools/vllm-bench.py`, 8 real-style prompts x 256
+tokens, greedy, 2 warmup passes + 8 measured reps, grand median reported.
+
+| arm | decode (grand median) | TTFT | GPU KV cache size |
+|---|---|---|---|
+| mtp, k=4 | 92.46 tok/s | 0.123 s | **1,102,163 tokens** |
+| dspark, k=4 (draft `qwen3.8-27b-dspark`) | 95.13 tok/s | 0.111 s | 721,420 tokens |
+| dflash, k=7, @0.92 (previous line) | 169-172 tok/s | 0.113 s | 603,522 tokens |
+
+- Both k=4 drafts land near half the k=7 dflash rate: the MTP head and DSpark's draft
+  are weaker proposers than DFlash2, so the verify step costs more than it earns back.
+  dspark is the better of the two at k=4 (+2.9%), mtp is the lighter one at rest.
+- The capacity gap is the interesting part. mtp keeps the whole 39.89 GiB for KV
+  because it drafts from the target model's own head, so the pool passes 1.1M tokens
+  with per-request `max-model-len` still 262144 -- that is ~4.2x the concurrency at
+  full context, or a 4x longer accumulated conversation. dspark's standalone draft
+  costs 2.77 GiB and 380K tokens of pool (721,420 vs 1,102,163).
+- Practical read: dflash k=7 stays the speed profile; mtp k=4 is the capacity profile
+  when a workload needs >604K of retained context and can settle for ~92 tok/s on a
+  single stream.
+
+### Note on the fp8 weight model
+
+`qwen3.8-27b-efficientthink-fp8` ships a `runtime/` directory that targets a different
+stack entirely: `runtime.lock.json` declares `platform=linux/arm64`,
+`hardware=NVIDIA DGX Spark GB10`, `image=efficientthink/sglang-spark:...`. It is an
+SGLang-on-Spark recipe and says nothing about this box, so the model was brought up
+on our own vLLM image instead. Its arch is `Qwen3_5ForCausalLM` (text-only; the AWQ
+serving model is `Qwen3_5ForConditionalGeneration`) and it carries its own MTP head
+(15 `mtp.*` keys) plus an fp8 DFlash2 draft in `qwen3.8-27b-efficientthink-dflash2-fp8`.
+
+### fp8 weight model, 0.96, fp8 KV: 444,795 tokens
+
+`qwen3.8-27b-efficientthink-fp8` (fp8 e4m3, 28.2 GiB) + `efficientthink-dflash2-fp8`
+draft k=7, split-KV kernel ON, `GMU=0.96`, brought up on our own image (its bundled
+`runtime/` targets SGLang on ARM64). Available KV memory 27.19 GiB -> **444,795
+tokens**, against 603,522 for the int4 AWQ model at 0.92 and 1,102,163 for the AWQ
+model with MTP k=4 at 0.96. The fp8 *weights* are ~13 GiB larger than int4, so the
+fp8 model trades context for weight precision on this box; its own MTP head (15
+`mtp.*` keys) is the way to buy the capacity back.
+
+### Drafters on this box, by quantization
+
+| checkpoint | quant | size | notes |
+|---|---|---|---|
+| `qwen3.8-27b-dflash2-w4a16` | compressed-tensors | 1.19 GiB | what production ran; needs `PATCH_DFLASH_QUANT_DRAFTER=1` (vllm#51620) or it dies at load with `'QKVParallelLinear' object has no attribute 'weight'` |
+| `qwen3.8-27b-dflash2` | none | 3.58 GiB | the launcher's default value, but not what the production profile passed |
+| `qwen3.8-27b-efficientthink-dflash2-fp8` | fp8 | 2.24 GiB | pairs with the fp8 weight model |
+| `qwen3.8-27b-dspark` | none | 3.46 GiB | unquantized draft for the DSpark method |
+
+### GMU 0.92 -> 0.96: measured capacity delta, and the draft-head accounting
+
+Same config, only `--gpu-memory-utilization` changed (awq-int4 + quantized DFlash2
+W4A16 k=7 + fp8 KV + split-KV kernel, one 170HX, GMU 0.96):
+`GPU KV cache size: 644,683 tokens` against 603,522 at 0.92 -- **+41,161 tokens
+(+6.8%)**, and the arithmetic checks out: 0.04 x 64 GiB = 2.56 GiB of extra pool at
+61.3 KiB/token predicts ~43.8K, measured 41.2K.
+
+What `--gpu-memory-utilization` actually governs: `pool = gmu x total - weights -
+activations - graphs - non-torch overhead`. The *allowance* scales with the card's
+total; every *consumer* in that subtraction is an absolute size. So the quantity that
+decides OOM risk is the absolute headroom, `(1 - gmu) x total`:
+
+| card | total | gmu | absolute headroom |
+|---|---|---|---|
+| 2080 Ti (earlier era) | 22 GB | 0.97 | 0.66 GB |
+| CMP 170HX | 64 GB | 0.92 | 5.12 GB |
+| CMP 170HX | 64 GB | **0.96** | **2.56 GB** |
+| CMP 170HX | 64 GB | 0.97 | 1.92 GB |
+
+0.96 on this card leaves 3.9x the absolute slack that 0.97 left on a 22 GB card. The
+two things that stay absolute and do not shrink with the percentage: vLLM's startup
+free-memory check (`free >= gmu x total`, which fails outright if a neighbour container
+holds a few GiB) and fragmentation/activation spikes at long prefill. This box runs
+several non-GPU containers, so 0.96 is the point that keeps both honest.
+
+Draft heads, by what they actually cost at load (measured, `Model loading took`):
+
+| target + draft | load | pool @0.96 |
+|---|---|---|
+| awq-int4 + DFlash2 W4A16 k=7 (quantized) | 19.0 GiB | 644,683 |
+| awq-int4 + DFlash2 k=7 (original, 3.58 GiB) | 21.49 GiB | 605,838 |
+| awq-int4 + DSpark k=4 | -- | 721,420 |
+| awq-int4 + MTP k=4 (no separate draft) | -- | 1,102,163 |
+
+The quantized draft is 2.39 GiB smaller on disk (1.19 vs 3.58 GiB) and 2.49 GiB
+smaller at load, exactly as a W4A16 draft should be.
+
+On the MTP head (810 MiB, 15 `mtp.*` tensors, BF16, 4.3% of the checkpoint): it is
+**not** loaded when the draft method is dflash/mtp-free. `qwen3_5.py` maps it away
+twice -- `orig_to_new_prefix={"model.language_model.": "model.", "mtp.": None}` at
+:324 and `{"mtp.": None}` at :480 -- and the load figure confirms it (awq-int4 18.41
+GiB + original 3.58 GiB = 21.99 expected; measured 21.49 because the index's packed
+sizes differ slightly from the tensor sums). So the head costs nothing unless
+`method=mtp` is selected, which is exactly why the mtp arm gets the largest pool: no
+draft model at all, drafting from the target's own head.
+
+### Draft quantization vs speed (same box, same 0.96, fp8 KV, k=7)
+
+| draft | decode (grand median) | TTFT | load memory | pool |
+|---|---|---|---|---|
+| DFlash2 k=7, original (3.58 GiB) | 131.39 tok/s | 0.109 s | 21.49 GiB | 605,838 |
+| DFlash2 W4A16 k=7 (1.19 GiB) | 123.45 tok/s | 0.111 s | 19.0 GiB | 644,683 |
+
+The original draft costs 2.49 GiB more at load and 39K tokens of pool; the quantized
+one is what production ran. Speed delta measured with the same harness in the same
+session so the comparison holds.
+
+Note for the record: the 169-172 tok/s figure in the 2026-09-12 note was taken with
+`+ async` scheduling on max-seqs 8; the arms here were launched through
+`launch-27b-kkx99.sh` with this checkout's defaults, so they are not config-identical
+to that earlier number. Within-session comparisons only.
+
+The A/B (both arms launched without `ASYNC_SCHED`, i.e. not production's scheduling):
+the quantized draft costs 6.0% of decode (131.39 -> 123.45) and buys 38,845 tokens of
+pool (605,838 -> 644,683). So draft quantization is a memory-for-speed trade, and a
+modest one.
+
+The larger term is the draft *state* per token, not the draft file. Effective cost,
+from `available KV / tokens`:
+
+| config | KiB/token | reading |
+|---|---|---|
+| mtp k=4, no draft model | 37.95 | target KV only |
+| dspark k=4, draft model | 53.95 | +16.0 for the draft's own state |
+| DFlash2 k=7, quantized | 64.08 | +~10 more for k=7 over k=4 |
+| DFlash2 k=7, original | 64.07 | identical -- the draft's *file* size does not move this |
+
+At 640K tokens the draft-state term is ~10 GiB of pool, several times the 1.19-3.58
+GiB the checkpoint occupies on disk. Dropping k from 7 to 4 is the cheaper lever.

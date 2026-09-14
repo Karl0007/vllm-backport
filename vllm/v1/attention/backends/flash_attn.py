@@ -1947,27 +1947,9 @@ def _spec_attn_qmax(impl) -> int:
 
 
 def _spec_attn_run(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k,
-                   block_table, num_reqs, max_query_len, k_scale=1.0, v_scale=1.0,
-                   layer_idx=-1):
+                   block_table, num_reqs, max_query_len, k_scale=1.0, v_scale=1.0):
     """Returns True when the kernel ran, False when the batch must fall back to FA2."""
     from vllm.v1.attention.ops.spec_decode_attn import SpecDecodeAttention
-
-    # Skipped while a graph is being captured: the validator syncs, which is illegal
-    # inside capture. Use --enforce-eager when diagnosing.
-    if _spec_attn_debug() and not torch.cuda.is_current_stream_capturing():
-        reason = _spec_attn_validate(impl, q, key_cache, block_table, cu_seqlens_q,
-                                     seqused_k, num_reqs, max_query_len,
-                                     out.stride(0), out.stride(1))
-        if reason:
-            logger.error(
-                "split-KV spec-decode attention: falling back to FA2 — %s "
-                "(num_reqs=%d max_seqlen_q=%d kv=%s cu=%s table=%s)",
-                reason, num_reqs, max_query_len,
-                seqused_k[:num_reqs].tolist(), cu_seqlens_q[: num_reqs + 1].tolist(),
-                block_table.shape,
-            )
-            _SPEC_ATTN_SKIPS.append(reason)
-            return False
 
     key = (impl.num_heads, impl.head_size, q.device)
     att = _SPEC_ATTN.get(key)
@@ -1980,130 +1962,8 @@ def _spec_attn_run(impl, q, key_cache, value_cache, out, cu_seqlens_q, seqused_k
             _spec_attn_qmax(impl),
         )
         _SPEC_ATTN[key] = att
-        # One-shot buffer map: an MMU fault (Xid 31) leaves no other trace, so the
-        # addresses let a post-mortem place the faulting address in (or outside) these
-        # allocations. Addresses are stable for the engine's life (allocated once, and
-        # a captured CUDA graph holds them).
-        if True:
-            logger.info(
-                "SPEC_ATTN buffers: q=%#x n=%d | k=%#x n=%d | v=%#x n=%d | bt=%#x n=%d "
-                "| cu=%#x n=%d | seqused=%#x n=%d | part_o=%#x n=%d | part_m=%#x n=%d "
-                "| part_l=%#x n=%d",
-                q.data_ptr(), q.numel(), key_cache.data_ptr(), key_cache.numel(),
-                value_cache.data_ptr(), value_cache.numel(),
-                block_table.data_ptr(), block_table.numel(),
-                cu_seqlens_q.data_ptr(), cu_seqlens_q.numel(),
-                seqused_k.data_ptr(), seqused_k.numel(),
-                att.part_o.data_ptr(), att.part_o.numel(),
-                att.part_m.data_ptr(), att.part_m.numel(),
-                att.part_l.data_ptr(), att.part_l.numel(),
-            )
-    if _spec_attn_debug() and not torch.cuda.is_current_stream_capturing():
-        diag = att.diag.tolist()
-        if diag[0] or diag[8]:
-            logger.error(
-                "SPEC_ATTN kernel guard: bad_blk=%d req=%d kvh=%d seg=%d t=%d first_pos=%d "
-                "min_blk=%d nblocks=%d | clamped_row=%d raw_q_start=%d q_len=%d "
-                "total_tokens=%d kv_len=%d",
-                *diag,
-            )
-        logger.info(
-            "SPEC_ATTN step: num_reqs=%d max_q=%d qrows=%d cu=%s seqused=%s "
-            "table=%s kvshape=%s audit=%r",
-            num_reqs, max_query_len, q.shape[0],
-            cu_seqlens_q[: num_reqs + 1].tolist(),
-            seqused_k[:num_reqs].tolist(),
-            tuple(block_table.shape), tuple(key_cache.shape), reason or "clean",
-        )
-        logger.info(
-            "split-KV spec-decode attention active: heads=%d head_dim=%d qmax=%d "
-            "segments=%d max_num_reqs=%d",
-            impl.num_heads,
-            impl.head_size,
-            att.qmax,
-            att.nseg,
-            att.max_num_reqs,
-        )
-    if _spec_attn_shadow():
-        # Control mode: allocate exactly what the kernel needs (so the memory layout
-        # matches a kernel-enabled run) but compute with FA2. Isolates "our kernel's
-        # execution" from "our kernel's allocations shifted someone else's OOB".
-        return False
     att.run(
         q, key_cache, value_cache, out, cu_seqlens_q, seqused_k, block_table,
-        impl.scale, num_reqs, max_query_len, k_scale, v_scale, layer_idx,
+        impl.scale, num_reqs, max_query_len, k_scale, v_scale,
     )
     return True
-
-
-# Debug-only metadata validation (VLLM_SPEC_ATTN_DEBUG=1). Cheap GPU reductions plus
-# a device sync, so it is off by default; it exists because a long-context batch with
-# a prefix-cache hit faulted the kernel with a virtual read (Xid 31) on 2026-09-12 and
-# the engine dies before anything can be inspected. A non-empty return means the batch
-# must go to FA2.
-def _spec_attn_shadow() -> bool:
-    import os
-
-    return os.environ.get("VLLM_SPEC_ATTN_SHADOW", "0") == "1"
-
-
-def _spec_attn_debug() -> bool:
-    import os
-
-    return os.environ.get("VLLM_SPEC_ATTN_DEBUG", "0") == "1"
-
-
-_SPEC_ATTN_SKIPS: list = []
-
-
-def _spec_attn_validate(impl, q, key_cache, block_table, cu_seqlens_q, seqused_k,
-                        num_reqs, max_query_len, out_stride0, out_stride1):
-    import torch
-
-    if num_reqs <= 0 or max_query_len <= 1:
-        return f"degenerate batch num_reqs={num_reqs} max_seqlen_q={max_query_len}"
-    nblocks, block_size = key_cache.shape[0], key_cache.shape[1]
-    seq = seqused_k[:num_reqs].to(torch.int64)
-    need = (seq + block_size - 1) // block_size
-    width = block_table.shape[1]
-    if int(need.max()) > width:
-        return f"needs {int(need.max())} blocks, table width {width}"
-    blk = block_table[:num_reqs, : int(need.max())].to(torch.int64)
-    if bool((blk < 0).any()):
-        return "negative block id in block_table"
-    if bool((blk >= nblocks).any()):
-        return f"block id >= num_blocks ({nblocks})"
-    cu = cu_seqlens_q[: num_reqs + 1].to(torch.int64)
-    if bool((cu[1:] < cu[:-1]).any()):
-        return "cu_seqlens_q not monotonic"
-    if int(cu[-1]) > q.shape[0]:
-        return f"cu_seqlens_q[-1]={int(cu[-1])} exceeds query rows {q.shape[0]}"
-    if int(cu[-1]) < max_query_len:
-        return f"cu_seqlens_q[-1]={int(cu[-1])} < max_seqlen_q={max_query_len}"
-    if max_query_len > _spec_attn_qmax(impl):
-        return f"max_seqlen_q={max_query_len} > qmax={_spec_attn_qmax(impl)}"
-    # Address audit: reproduce the kernel's pointer arithmetic and compare the highest
-    # offset it can reach with each tensor's storage. A violation here means the launch
-    # would read/write outside the allocation.
-    kvh_max = key_cache.shape[2] - 1
-    d_max = key_cache.shape[3] - 1
-    k_off = int(blk.max()) * key_cache.stride(0)
-    k_off += (block_size - 1) * key_cache.stride(1) + kvh_max * key_cache.stride(2) + d_max
-    if k_off >= key_cache.numel():
-        return (f"key/value offset {k_off} >= numel {key_cache.numel()} "
-                f"(max block id {int(blk.max())}, nblocks {nblocks}, "
-                f"strides {key_cache.stride()}, shape {tuple(key_cache.shape)})")
-    att = _SPEC_ATTN.get((impl.num_heads, impl.head_size, q.device))
-    if att is not None:
-        qmax, nseg = att.qmax, att.nseg
-        hq = impl.num_heads
-        rows = max(int(cu[-1]), 1)
-        pidx = ((num_reqs - 1) * hq + hq - 1) * qmax + (max_query_len - 1)
-        p_off = (pidx * nseg + nseg - 1) * att.part_o.shape[1] + att.part_o.shape[1] - 1
-        if p_off >= att.part_o.numel():
-            return (f"partial buffer offset {p_off} >= numel {att.part_o.numel()} "
-                    f"(rows={att.part_o.shape[0]} num_reqs={num_reqs} qmax={qmax} nseg={nseg})")
-        o_off = (int(cu[-1]) - 1) * out_stride0 + (hq - 1) * out_stride1 + impl.head_size - 1
-        if o_off >= q.numel():
-            return (f"query/output offset {o_off} >= numel {q.numel()} (cu[-1]={rows})")
-    return ""

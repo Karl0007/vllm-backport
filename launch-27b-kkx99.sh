@@ -25,7 +25,7 @@ PORT="${PORT:-18000}"
 NAME="${NAME:-orchestrator-vllm-27b}"
 
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"
-GMU="${GMU:-0.92}"
+GMU="${GMU:-0.96}"
 MAX_SEQS="${MAX_SEQS:-8}"
 MAX_BATCHED="${MAX_BATCHED:-8192}"
 DTYPE="${DTYPE:-bfloat16}"
