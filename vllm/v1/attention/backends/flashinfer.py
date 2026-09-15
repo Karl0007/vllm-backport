@@ -2258,7 +2258,7 @@ class FlashInferImpl(AttentionImpl):
 
                     if needs_fp8_out_prefill:
                         output[
-                            num_decode_tokens : num_decode_tokens + num_prefill_tokens
+                            num_decode_tokens : num_decode_tokens + real_prefill
                         ].copy_(out_prefill)
             else:
                 assert isinstance(attn_metadata.prefill, TRTLLMPrefill)
@@ -2295,7 +2295,7 @@ class FlashInferImpl(AttentionImpl):
                 # Use a pre-allocated FP8 buffer and dequantize afterwards.
                 needs_fp8_out = self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
                 if needs_fp8_out:
-                    out = self._nvfp4_fp8_out[:num_prefill_tokens]
+                    out = self._nvfp4_fp8_out[:real_prefill]
 
                 prefill_kv_block_scales = None
                 if self.is_kvcache_nvfp4:
@@ -2366,8 +2366,8 @@ class FlashInferImpl(AttentionImpl):
 
                 if needs_fp8_out:
                     output[
-                        num_decode_tokens : num_decode_tokens + num_prefill_tokens
-                    ].copy_(out[:num_prefill_tokens])
+                        num_decode_tokens : num_decode_tokens + real_prefill
+                    ].copy_(out[:real_prefill])
 
         if num_decode_tokens > 0:
             decode_query = query[:num_decode_tokens]
